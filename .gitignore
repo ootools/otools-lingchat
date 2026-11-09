@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-pack/
+public/onnx/
+target/
+lib/*.dylib
+lib/*.dll
+lib/*.so
+.DS_Store
+.env*
+!.env.example

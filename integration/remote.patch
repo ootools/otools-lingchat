@@ -1,0 +1,106 @@
+diff --git a/src/invoke_policy.rs b/src/invoke_policy.rs
+new file mode 100644
+index 0000000..d5cbf37
+--- /dev/null
++++ b/src/invoke_policy.rs
+@@ -0,0 +1,47 @@
++//! Browser-forwarded RPC has no authenticated plugin WebView identity.
++
++pub(crate) fn validate_forwarded_command(command: &str) -> Result<(), &'static str> {
++    if command.is_empty() || command.len() > 256 || !command.bytes().all(|byte| {
++        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'|' | b'.')
++    }) {
++        return Err("Invalid RPC command name");
++    }
++    if [
++        "otools_host_plugin_data_", "otools_host_ai_",
++        "otools_host_observation_", "otools_host_plugin_reminders_",
++    ].iter().any(|prefix| command.starts_with(prefix)) {
++        return Err("This capability requires an authenticated local plugin or consent window");
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::validate_forwarded_command;
++
++    #[test]
++    fn rejects_commands_that_require_a_local_plugin_or_consent_identity() {
++        for command in [
++            "otools_host_plugin_data_list", "otools_host_plugin_data_consent_decide",
++            "otools_host_ai_start", "otools_host_ai_read",
++            "otools_host_observation_approve", "otools_host_observation_capture",
++            "otools_host_plugin_reminders_configure",
++        ] {
++            assert!(validate_forwarded_command(command).is_err(), "{command}");
++        }
++    }
++
++    #[test]
++    fn preserves_ordinary_remote_and_plugin_commands() {
++        for command in ["otools_ai_generate_text", "get_otools_plugin_localstate", "plugin:dialog|open"] {
++            assert!(validate_forwarded_command(command).is_ok());
++        }
++    }
++
++    #[test]
++    fn rejects_script_fragments_before_webview_evaluation() {
++        for command in ["", "cmd\"; alert(1); //", "cmd\\x", "cmd\n", " cmd"] {
++            assert!(validate_forwarded_command(command).is_err());
++        }
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index c979c12..9a61a4c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,6 @@
+ pub mod host;
+ mod otools_web;
++mod invoke_policy;
+ mod server;
+ 
+ use std::path::PathBuf;
+diff --git a/src/server.rs b/src/server.rs
+index 5d1c730..fc677a3 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -2779,6 +2779,12 @@ mod tests {
+ }
+ 
+ async fn invoke_command(req: &WsIncoming) -> RpcResponse {
++    if let Err(message) = crate::invoke_policy::validate_forwarded_command(&req.command) {
++        return RpcResponse {
++            uuid: req.uuid.clone(), status: "error".into(),
++            payload: serde_json::Value::String(message.into()),
++        };
++    }
+     // 从全局获取 AppHandle（在 plugin setup 时存入）
+     let app = match crate::app_handle() {
+         Some(h) => h,
+@@ -2803,10 +2809,10 @@ async fn invoke_command(req: &WsIncoming) -> RpcResponse {
+     let js = format!(
+         r#"
+         (async () => {{
+-            const uuid = "{uuid}";
++            const uuid = {uuid};
+             const callbackUrl = "http://127.0.0.1:{port}/__rpc_callback__";
+             try {{
+-                const result = await window.__TAURI_INTERNALS__.invoke("{command}", {args});
++                const result = await window.__TAURI_INTERNALS__.invoke({command}, {args});
+                 await fetch(callbackUrl, {{
+                     method: "POST",
+                     headers: {{ "Content-Type": "application/json" }},
+@@ -2824,9 +2830,9 @@ async fn invoke_command(req: &WsIncoming) -> RpcResponse {
+             }}
+         }})();
+         "#,
+-        command = req.command,
++        command = serde_json::to_string(&req.command).expect("command string serializes"),
+         args = args_json,
+-        uuid = req.uuid,
++        uuid = serde_json::to_string(&req.uuid).expect("request id serializes"),
+         port = port,
+     );
+ 

@@ -1,0 +1,35 @@
+{
+  "name": "otools-lingchat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LingChat companion for Otools custom windows and host AI services.",
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "node scripts/prepare-runtime.mjs && vite --host 127.0.0.1 --port 5995",
+    "build": "node scripts/prepare-runtime.mjs && vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run && node --test scripts/pack.test.mjs",
+    "pack": "node scripts/pack.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.10.1",
+    "@tauri-apps/plugin-dialog": "2.6.0",
+    "fflate": "0.8.2",
+    "onnxruntime-web": "1.21.0",
+    "otools-plugin-sdk": "file:vendor/otools-plugin-sdk",
+    "vue": "3.5.27",
+    "yaml": "2.8.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "5.2.4",
+    "jsdom": "26.1.0",
+    "typescript": "5.9.3",
+    "vite": "6.4.1",
+    "vitest": "3.2.4",
+    "vue-tsc": "2.2.12"
+  }
+}

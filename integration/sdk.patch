@@ -1,0 +1,1085 @@
+diff --git a/package.json b/package.json
+index aa21675..f1bab02 100644
+--- a/package.json
++++ b/package.json
+@@ -34,6 +34,22 @@
+       "import": "./dist/index.js",
+       "default": "./dist/index.js"
+     },
++    "./ai-factory": {
++      "types": "./dist/ai-factory.d.ts",
++      "import": "./dist/ai-factory.js"
++    },
++    "./plugin-data-factory": {
++      "types": "./dist/plugin-data-factory.d.ts",
++      "import": "./dist/plugin-data-factory.js"
++    },
++    "./reminder-factory": {
++      "types": "./dist/reminder-factory.d.ts",
++      "import": "./dist/reminder-factory.js"
++    },
++    "./observation-factory": {
++      "types": "./dist/observation-factory.d.ts",
++      "import": "./dist/observation-factory.js"
++    },
+     "./capture": {
+       "types": "./dist/capture.d.ts",
+       "import": "./dist/capture.js",
+@@ -141,6 +157,8 @@
+   "scripts": {
+     "build": "vite build",
+     "sync:capture-injection": "node scripts/sync-capture-injection.mjs",
++    "sync:service-injection": "node scripts/sync-service-injection.mjs",
++    "check:service-injection": "node scripts/sync-service-injection.mjs --check",
+     "check:capture-injection": "node scripts/sync-capture-injection.mjs --check",
+     "test": "vitest run",
+     "typecheck": "tsc --noEmit",
+diff --git a/scripts/sync-capture-injection.mjs b/scripts/sync-capture-injection.mjs
+index 60f2bd7..47f6470 100644
+--- a/scripts/sync-capture-injection.mjs
++++ b/scripts/sync-capture-injection.mjs
+@@ -7,7 +7,9 @@ const source = readFileSync(new URL('../src/capture-factory.ts', import.meta.url
+ const compiled = ts.transpileModule(source, {
+   compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext },
+ }).outputText.replace(/^export (?=(?:class|function|const) )/gm, '');
+-const target = new URL('../../../src/platform/runtime/otools/embedded-runtime.js', import.meta.url);
++const target = process.env.OTOOLS_HOST_ROOT
++  ? `${process.env.OTOOLS_HOST_ROOT}/src/platform/runtime/otools/embedded-runtime.js`
++  : new URL('../../../src/platform/runtime/otools/embedded-runtime.js', import.meta.url);
+ const input = readFileSync(target, 'utf8');
+ const begin = '// BEGIN GENERATED CAPTURE FACTORY\n';
+ const end = '// END GENERATED CAPTURE FACTORY';
+diff --git a/scripts/sync-service-injection.mjs b/scripts/sync-service-injection.mjs
+new file mode 100644
+index 0000000..5f4923d
+--- /dev/null
++++ b/scripts/sync-service-injection.mjs
+@@ -0,0 +1,45 @@
++import { readFileSync, writeFileSync } from 'node:fs';
++import { resolve, dirname } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import ts from 'typescript';
++
++const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
++const hostFlag = process.argv.indexOf('--host');
++const host = hostFlag >= 0 ? resolve(process.argv[hostFlag + 1]) : resolve(root, '../..');
++const target = resolve(host, 'src/platform/runtime/otools/embedded-runtime.js');
++const factories = [
++  ['ai', 'ai-factory', 'createAiApi'],
++  ['data', 'plugin-data-factory', 'createPluginDataApi'],
++  ['observation', 'observation-factory', 'createObservationApi'],
++  ['reminders', 'reminder-factory', 'createReminderApi'],
++];
++const blocks = factories.map(([, file, factory]) => {
++  const source = readFileSync(resolve(root, `src/${file}.ts`), 'utf8');
++  const compiled = ts.transpileModule(source, {
++    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext },
++  }).outputText.replace(/^export (?=(?:class|function|const) )/gm, '')
++    .replace(/^export \* from ['"][^'"]+['"];?\s*$/gm, '')
++    .replace(/^export \{\};?\s*$/gm, '');
++  // Each factory has private helper names. Keep their lexical scopes independent.
++  return `const ${factory} = (() => {\n${compiled}\nreturn ${factory};\n})();`;
++});
++const begin = '// BEGIN GENERATED PLUGIN SERVICES\n';
++const end = '// END GENERATED PLUGIN SERVICES';
++const block = `${begin}${blocks.join('\n\n')}\n${end}`;
++const input = readFileSync(target, 'utf8');
++let output;
++if (input.includes(begin)) {
++  const endAt = input.indexOf(end, input.indexOf(begin));
++  if (endAt < 0) throw new Error('Missing service injection end marker');
++  output = input.slice(0, input.indexOf(begin)) + block + input.slice(endAt + end.length);
++} else {
++  if (!input.includes('  const otools = {')) throw new Error('Missing Otools API declaration');
++  output = input.replace('  const otools = {', `  ${block}\n\n  const otools = {`);
++}
++for (const [name, , factory] of factories) {
++  const entry = `    ${name}: ${factory}({ invoke }),`;
++  if (!output.includes(entry)) output = output.replace('  const otools = {', `  const otools = {\n${entry}`);
++}
++if (process.argv.includes('--check')) {
++  if (output !== input) throw new Error('Plugin service injection is stale; run sync:service-injection with --host');
++} else if (output !== input) writeFileSync(target, output);
+diff --git a/src/ai-factory.ts b/src/ai-factory.ts
+new file mode 100644
+index 0000000..39dd7ae
+--- /dev/null
++++ b/src/ai-factory.ts
+@@ -0,0 +1,121 @@
++import type { AiApi, AiCapabilities, AiEvent, AiReadResult, AiTransport } from './ai-types';
++export type * from './ai-types';
++
++export class AiError extends Error {
++  constructor(public readonly code: string, message = code) { super(message); this.name = 'AiError'; }
++}
++
++function normalizeError(error: unknown): Error {
++  if (error instanceof Error) return error;
++  if (typeof error === 'string') return new AiError(error);
++  const value = error as { code?: unknown; message?: unknown } | null;
++  return new AiError(typeof value?.code === 'string' ? value.code : 'transportFailed', typeof value?.message === 'string' ? value.message : undefined);
++}
++
++function validateBatch(value: AiReadResult, id: string, after: number): void {
++  const invalid = () => { throw new AiError('invalidResponse'); };
++  if (!value || value.id !== id || !Array.isArray(value.events) || value.events.length > 256 || typeof value.done !== 'boolean') invalid();
++  let terminal = false;
++  let bytes = 0;
++  for (const event of value.events) {
++    if (!event || !Number.isSafeInteger(event.sequence) || event.sequence !== ++after || terminal) invalid();
++    switch (event.type) {
++      case 'delta':
++        if (typeof event.text !== 'string') invalid();
++        bytes += event.text.length;
++        if (bytes > 256 * 1024) invalid();
++        break;
++      case 'error':
++        if (typeof event.error !== 'string') invalid();
++        terminal = true;
++        break;
++      case 'done': case 'cancelled': terminal = true; break;
++      default: invalid();
++    }
++  }
++  if (value.done !== terminal) invalid();
++}
++
++/** Dependency-free factory for both the SDK runtime and the injected window API. */
++export function createAiApi(transport: AiTransport): AiApi {
++  const call = async <T>(method: string, args?: Record<string, unknown>): Promise<T> => {
++    try { return await transport.invoke(`otools_host_ai_${method}`, args) as T; }
++    catch (error) { throw normalizeError(error); }
++  };
++  const api: AiApi = {
++    capabilities: () => call<AiCapabilities>('capabilities'),
++    start: request => call('start', { request }),
++    read: options => call('read', options),
++    cancel: options => call('cancel', options),
++    consume(request, options = {}) {
++      return new Promise((resolve, reject) => {
++        let done = false;
++        let id: string | undefined;
++        let after = 0;
++        let text = '';
++        let timer: ReturnType<typeof setTimeout> | undefined;
++        let deadline: ReturnType<typeof setTimeout> | undefined;
++        const cancel = (job: string) => { void api.cancel({ id: job }).catch(() => {}); };
++        const cleanup = () => {
++          clearTimeout(timer); clearTimeout(deadline);
++          options.signal?.removeEventListener('abort', abort);
++        };
++        const fail = (error: unknown) => {
++          if (done) return;
++          done = true; cleanup();
++          if (id) cancel(id);
++          reject(normalizeError(error));
++        };
++        const abort = () => fail(new AiError('cancelled'));
++        options.signal?.addEventListener('abort', abort, { once: true });
++        if (options.signal?.aborted) { abort(); return; }
++        deadline = setTimeout(() => fail(new AiError('timeout')), 10 * 60 * 1000);
++        const interval = Number.isFinite(options.pollIntervalMs) ? Math.max(0, Math.min(10_000, options.pollIntervalMs!)) : 100;
++        const poll = async () => {
++          if (done || !id) return;
++          try {
++            const batch = await api.read({ id, after });
++            if (done) return;
++            validateBatch(batch, id, after);
++            for (const event of batch.events) {
++              after = event.sequence;
++              if (event.type === 'delta') {
++                text += event.text;
++                if (text.length > 4 * 1024 * 1024) throw new AiError('responseTooLarge');
++              }
++              options.onEvent?.(event);
++              if (done) return;
++              if (event.type === 'error') throw new AiError(event.error);
++              if (event.type === 'cancelled') throw new AiError('cancelled');
++            }
++            if (batch.done) {
++              done = true; cleanup();
++              // Drop retained plaintext promptly; do not make completed output wait
++              // for a second IPC round trip. Host TTL is the fallback for failed ack.
++              void api.read({ id, after }).catch(() => {});
++              resolve({ id, text });
++            } else timer = setTimeout(() => { void poll(); }, interval);
++          } catch (error) { fail(error); }
++        };
++        void (async () => {
++          try {
++            const capability = await api.capabilities();
++            if (done) return;
++            if (!capability?.configured) throw new AiError('notConfigured');
++            if (!capability.streaming || !capability.cancellation) throw new AiError('unsupported');
++            // Unknown vision metadata must not be interpreted as unsupported.
++            if (capability.vision === 'unsupported' && request.messages.some(message => message.content.some(part => part.type === 'image'))) {
++              throw new AiError('visionUnsupported');
++            }
++            const started = await api.start(request);
++            if (!started || typeof started.id !== 'string' || !started.id) throw new AiError('invalidResponse');
++            id = started.id;
++            if (done) { cancel(id); return; }
++            void poll();
++          } catch (error) { fail(error); }
++        })();
++      });
++    },
++  };
++  return api;
++}
+diff --git a/src/ai-types.ts b/src/ai-types.ts
+new file mode 100644
+index 0000000..4dcd252
+--- /dev/null
++++ b/src/ai-types.ts
+@@ -0,0 +1,36 @@
++export type AiRole = 'system' | 'user' | 'assistant';
++export type AiContent = { type: 'text'; text: string } | { type: 'image'; captureImageId: string };
++export interface AiMessage { role: AiRole; content: AiContent[] }
++/** Provider, model, URLs, and credentials are exclusively host-configured. */
++export interface AiRequest { messages: AiMessage[]; temperature?: number; maxTokens?: number }
++export interface AiCapabilities {
++  /** Host settings resolve to a model. This does not assert provider reachability. */
++  configured: boolean;
++  provider?: string;
++  model?: string;
++  streaming: boolean;
++  cancellation: boolean;
++  /** Unknown means no reliable model metadata; image requests may still succeed. */
++  vision: 'unknown' | 'supported' | 'unsupported';
++  reason?: string;
++}
++export type AiEvent =
++  | { sequence: number; type: 'delta'; text: string }
++  | { sequence: number; type: 'done' | 'cancelled' }
++  | { sequence: number; type: 'error'; error: string };
++export interface AiReadResult { id: string; events: AiEvent[]; done: boolean }
++export interface AiTransport { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> }
++export interface AiConsumeOptions {
++  signal?: AbortSignal;
++  onEvent?: (event: AiEvent) => void;
++  pollIntervalMs?: number;
++}
++export interface AiApi {
++  capabilities(): Promise<AiCapabilities>;
++  start(request: AiRequest): Promise<{ id: string }>;
++  /** The cursor acknowledges earlier events; older cursors subsequently fail. */
++  read(options: { id: string; after: number }): Promise<AiReadResult>;
++  cancel(options: { id: string }): Promise<void>;
++  /** Owns polling, terminal acknowledgement and cancellation on abort/failure. */
++  consume(request: AiRequest, options?: AiConsumeOptions): Promise<{ id: string; text: string }>;
++}
+diff --git a/src/index.ts b/src/index.ts
+index d2c1b48..4a5859a 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,4 +1,11 @@
+ export * from './capture';
++export { createAiApi } from './ai-factory';
++export type * from './ai-types';
++export { createPluginDataApi } from './plugin-data-factory';
++export type * from './plugin-data-types';
++export * from './observation-factory';
++export { createReminderApi } from './reminder-factory';
++export type * from './reminder-types';
+ export { createOtoolsAliasMap } from "./aliases";
+ export { otoolsTauriShimPlugin } from "./vite";
+ export {
+diff --git a/src/observation-factory.ts b/src/observation-factory.ts
+new file mode 100644
+index 0000000..c38b020
+--- /dev/null
++++ b/src/observation-factory.ts
+@@ -0,0 +1,94 @@
++import type { CaptureImage } from './capture-factory';
++export type ObservationTarget = { kind: 'screen'; displayId: string } | { kind: 'window'; windowId: string };
++export interface ObservationTargets {
++  screens: Array<{ id: string; name: string }>;
++  windows: Array<{ id: string; title: string; appName: string }>;
++}
++export interface ObservationStatus {
++  id: string; state: 'pending' | 'active' | 'stopped'; target: ObservationTarget; intervalMs: number; reason?: string;
++}
++export interface ObservationRequest { target: ObservationTarget; intervalMs?: number }
++export interface ObservationTransport { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> }
++export interface ObservationApi {
++  /** Enumerates native metadata only. Does not capture or request consent. */
++  targets(): Promise<ObservationTargets>;
++  /** Opens trusted host consent; returns pending. Plugins cannot approve it. */
++  request(options: ObservationRequest): Promise<ObservationStatus>;
++  status(options: { id: string }): Promise<ObservationStatus>;
++  /** Returns a lease; release it using capture.release after use. No timer is started. */
++  capture(options: { id: string }): Promise<CaptureImage>;
++  stop(options: { id: string }): Promise<void>;
++}
++export class ObservationError extends Error {
++  constructor(public readonly code: string, message: string) { super(message); this.name = 'ObservationError'; }
++}
++function normalize(error: unknown): ObservationError {
++  if (error instanceof ObservationError) return error;
++  let value = error;
++  if (typeof value === 'string') { try { value = JSON.parse(value); } catch { /* Plain IPC error. */ } }
++  const record = value && typeof value === 'object' ? value as { code?: string; message?: string } : undefined;
++  return new ObservationError(record?.code ?? 'unsupported', record?.message ?? String(error));
++}
++function invalid(): never { throw new ObservationError('invalidRequest', 'Provide an explicit target and a sampling interval of at least 30000 ms'); }
++function checkId(id: string) { if (typeof id !== 'string' || !id || id.length > 128) invalid(); }
++function checkStatus(value: ObservationStatus, id?: string): ObservationStatus {
++  if (!value || typeof value.id !== 'string' || (id && value.id !== id) || !['pending', 'active', 'stopped'].includes(value.state)) {
++    throw new ObservationError('invalidResponse', 'Invalid observation status');
++  }
++  return value;
++}
++/** Dependency-free factory also suitable for the host's plain-webview injection. */
++export function createObservationApi(transport: ObservationTransport): ObservationApi {
++  const pending = new Map<string, { cancelled: boolean }>();
++  const call = async <T>(method: string, args?: Record<string, unknown>): Promise<T> => {
++    try { return await transport.invoke(`otools_host_observation_${method}`, args) as T; }
++    catch (error) { throw normalize(error); }
++  };
++  const status = async ({ id }: { id: string }) => {
++    checkId(id);
++    const value = checkStatus(await call<ObservationStatus>('status', { id }), id);
++    if (value.state === 'stopped') { const task = pending.get(id); if (task) task.cancelled = true; }
++    return value;
++  };
++  return {
++    targets: () => call('targets'),
++    async request(options) {
++      const target = options?.target;
++      const targetId = target?.kind === 'screen' ? target.displayId : target?.kind === 'window' ? target.windowId : undefined;
++      const intervalMs = options?.intervalMs ?? 60_000;
++      if (typeof targetId !== 'string' || !/^[1-9]\d{0,9}$/.test(targetId) || Number(targetId) > 0xffffffff
++        || !Number.isSafeInteger(intervalMs) || intervalMs < 30_000 || intervalMs > 3_600_000) invalid();
++      return checkStatus(await call<ObservationStatus>('request', { options: { target, intervalMs } }));
++    },
++    status,
++    async capture({ id }) {
++      checkId(id);
++      if (pending.has(id) || pending.size >= 32) throw new ObservationError('busy', 'An observation capture is already in progress');
++      const task = { cancelled: false }; pending.set(id, task);
++      let image: CaptureImage | undefined;
++      let delivered = false;
++      try {
++        image = await call<CaptureImage>('capture', { id });
++        if (!image || typeof image.imageId !== 'string' || !image.imageId || image.imageId.length > 128
++          || image.mimeType !== 'image/png' || !Number.isSafeInteger(image.width) || image.width <= 0
++          || !Number.isSafeInteger(image.height) || image.height <= 0 || image.width * image.height > 64_000_000
++          || !Number.isFinite(image.expiresAt)) throw new ObservationError('invalidResponse', 'Invalid observation image');
++        if (task.cancelled || (await status({ id })).state !== 'active' || task.cancelled) {
++          throw new ObservationError('stopped', 'Observation stopped before capture delivery');
++        }
++        delivered = true;
++        return image;
++      } finally {
++        pending.delete(id);
++        if (!delivered && typeof image?.imageId === 'string' && image.imageId.length <= 128) {
++          try { await transport.invoke('otools_host_capture_release', { imageId: image.imageId }); } catch { /* Host also revokes its lease on stop. */ }
++        }
++      }
++    },
++    async stop({ id }) {
++      checkId(id);
++      const task = pending.get(id); if (task) task.cancelled = true;
++      await call('stop', { id });
++    },
++  };
++}
+diff --git a/src/otools-globals.ts b/src/otools-globals.ts
+index e691383..36aa4a2 100644
+--- a/src/otools-globals.ts
++++ b/src/otools-globals.ts
+@@ -113,6 +113,10 @@ export interface OToolsEnv {
+ 
+ export interface OToolsAPI {
+   capture?: import('./capture-factory').CaptureApi;
++  ai?: import('./ai-types').AiApi;
++  data?: ReturnType<typeof import('./plugin-data-factory').createPluginDataApi>;
++  observation?: import('./observation-factory').ObservationApi;
++  reminders?: ReturnType<typeof import('./reminder-factory').createReminderApi>;
+   isDev(): boolean;
+   isMacOS(): boolean;
+   isWindows(): boolean;
+diff --git a/src/plugin-data-factory.ts b/src/plugin-data-factory.ts
+new file mode 100644
+index 0000000..dc6fba3
+--- /dev/null
++++ b/src/plugin-data-factory.ts
+@@ -0,0 +1,80 @@
++import type {
++  PluginDataApi, PluginDataChangesPage, PluginDataErrorCode, PluginDataFailure, PluginDataTransport,
++} from './plugin-data-types';
++export type * from './plugin-data-types';
++
++export class PluginDataError extends Error implements PluginDataFailure {
++  constructor(public readonly code: PluginDataErrorCode, message: string) {
++    super(message);
++    this.name = 'PluginDataError';
++  }
++}
++const codes: PluginDataErrorCode[] = ['permissionDenied', 'forbidden', 'conflict', 'deleted', 'resyncRequired', 'invalidCursor', 'invalidRequest', 'storageFailed', 'unavailable', 'unsupported', 'busy'];
++function normalizeError(error: unknown): PluginDataError {
++  if (error instanceof PluginDataError) return error;
++  let value = error;
++  if (typeof value === 'string') { try { value = JSON.parse(value); } catch { /* Plain transport error. */ } }
++  const record = value && typeof value === 'object' ? value as Partial<PluginDataFailure> : undefined;
++  const message = typeof record?.message === 'string' ? record.message : String(error);
++  const code = record?.code && codes.includes(record.code) ? record.code
++    : /unknown command|command .*not found|runtime.*unavailable|bridge.*unavailable/i.test(message) ? 'unsupported' : 'unavailable';
++  return new PluginDataError(code, message);
++}
++function revision(value: number): void {
++  if (!Number.isSafeInteger(value) || value < 0) throw new PluginDataError('invalidRequest', 'expectedRevision must be a non-negative safe integer');
++}
++
++/** Dependency-free client suitable for native SDK imports and host runtime injection. */
++export function createPluginDataApi(transport: PluginDataTransport): PluginDataApi {
++  const call = async <T>(method: string, request?: unknown): Promise<T> => {
++    try { return await transport.invoke(`otools_host_plugin_data_${method}`, request === undefined ? undefined : { request }) as T; }
++    catch (error) { throw normalizeError(error); }
++  };
++  const api: PluginDataApi = {
++    discover: () => call('discover'),
++    list: request => call('list', request),
++    get: request => call('get', request),
++    async put(request) { revision(request.expectedRevision); return call('put', request); },
++    async remove(request) { revision(request.expectedRevision); return call('remove', request); },
++    changes: request => call('changes', request),
++    requestAccess: request => call('request_access', request),
++    revokeAccess: request => call('revoke_access', request),
++    subscribe(request, onChanges, options) {
++      let stopped = false;
++      let timer: ReturnType<typeof setTimeout> | undefined;
++      let after = request.after;
++      // Copy the query so mutation of the caller's object cannot change cursor ownership.
++      const query = { type: request.type, provider: request.provider ? { ...request.provider } : undefined, limit: request.limit };
++      const interval = Math.max(250, Math.min(60_000, Number.isFinite(options.intervalMs) ? options.intervalMs! : 1000));
++      const stop = () => {
++        if (stopped) return;
++        stopped = true;
++        clearTimeout(timer);
++        options.signal?.removeEventListener('abort', stop);
++      };
++      const poll = async () => {
++        if (stopped) return;
++        try {
++          const page = await call<PluginDataChangesPage<never>>('changes', { ...query, after });
++          if (stopped) return;
++          if (!page || typeof page.after !== 'string' || !Array.isArray(page.items) || typeof page.hasMore !== 'boolean'
++            || (page.hasMore && page.after === after)) {
++            throw new PluginDataError('unavailable', 'Host returned an invalid changes page');
++          }
++          after = page.after;
++          await onChanges(page);
++          if (!stopped) timer = setTimeout(() => { void poll(); }, page.hasMore ? 0 : interval);
++        } catch (error) {
++          if (stopped) return;
++          stop();
++          try { options.onError(normalizeError(error)); } catch { /* An error callback must not leave polling alive. */ }
++        }
++      };
++      options.signal?.addEventListener('abort', stop, { once: true });
++      if (options.signal?.aborted) stop();
++      else void poll();
++      return stop;
++    },
++  };
++  return api;
++}
+diff --git a/src/plugin-data-types.ts b/src/plugin-data-types.ts
+new file mode 100644
+index 0000000..08ad5ac
+--- /dev/null
++++ b/src/plugin-data-types.ts
+@@ -0,0 +1,67 @@
++export interface PluginDataIdentity { source: string; uuid: string }
++export interface PluginDataDeclaration { provides?: string[]; consumes?: string[] }
++export interface PluginDataResource<T = unknown, P = unknown> {
++  provider: PluginDataIdentity;
++  type: string;
++  id: string;
++  revision: number;
++  updatedAt: number;
++  deleted: boolean;
++  data: T;
++  /** Present only for provider reads. Change notifications always omit private data. */
++  privateData?: P;
++}
++export interface PluginDataProvider { provider: PluginDataIdentity; types: string[] }
++export type PluginDataScope = { kind: 'all' } | { kind: 'ids'; ids: string[] };
++/** Omitting provider selects the authenticated caller's own resources. */
++export interface PluginDataReadRequest { provider?: PluginDataIdentity; type: string }
++export interface PluginDataListRequest extends PluginDataReadRequest { cursor?: string; limit?: number }
++export interface PluginDataGetRequest extends PluginDataReadRequest { id: string }
++export interface PluginDataPutRequest<T = unknown, P = unknown> {
++  type: string; id: string; data: T; privateData?: P;
++  /** Required: 0 creates, otherwise compare-and-swap against the current revision. */
++  expectedRevision: number;
++  /** Explicit recreation additionally requires the exact current tombstone revision. */
++  recreate?: boolean;
++}
++export interface PluginDataRemoveRequest { type: string; id: string; expectedRevision: number }
++export interface PluginDataChangesRequest extends PluginDataReadRequest { after: string; limit?: number }
++export interface PluginDataListPage<T = unknown, P = unknown> {
++  /** Includes tombstones; filter deleted records when rendering live content. */
++  items: PluginDataResource<T, P>[];
++  next: string | null;
++  /** Poll after this snapshot; list continuation fails with resyncRequired if it changes. */
++  after: string;
++}
++export interface PluginDataChangesPage<T = unknown> {
++  /** Shared projections only. Owners must get() to refresh private fields. */
++  items: PluginDataResource<T, never>[];
++  after: string;
++  hasMore: boolean;
++}
++export interface PluginDataAccessRequest { provider: PluginDataIdentity; type: string; scope?: PluginDataScope; subscribe?: boolean }
++export interface PluginDataAccessStatus { id: string; status: 'pending' }
++export interface PluginDataRevokeRequest { provider: PluginDataIdentity; type: string }
++export type PluginDataErrorCode = 'permissionDenied' | 'forbidden' | 'conflict' | 'deleted' | 'resyncRequired' | 'invalidCursor' | 'invalidRequest' | 'storageFailed' | 'unavailable' | 'unsupported' | 'busy';
++export interface PluginDataFailure { code: PluginDataErrorCode; message: string }
++export interface PluginDataTransport { invoke(command: string, args?: Record<string, unknown>): Promise<unknown> }
++export interface PluginDataSubscribeOptions {
++  intervalMs?: number;
++  signal?: AbortSignal;
++  /** Errors stop polling. In particular, resyncRequired requires a fresh list snapshot. */
++  onError(error: Error & PluginDataFailure): void;
++}
++export interface PluginDataApi {
++  discover(): Promise<PluginDataProvider[]>;
++  list<T = unknown, P = unknown>(request: PluginDataListRequest): Promise<PluginDataListPage<T, P>>;
++  get<T = unknown, P = unknown>(request: PluginDataGetRequest): Promise<PluginDataResource<T, P> | null>;
++  put<T = unknown, P = unknown>(request: PluginDataPutRequest<T, P>): Promise<PluginDataResource<T, P>>;
++  remove(request: PluginDataRemoveRequest): Promise<PluginDataResource<null, never>>;
++  changes<T = unknown>(request: PluginDataChangesRequest): Promise<PluginDataChangesPage<T>>;
++  /** Always opens host consent; a pending request is never an access grant. */
++  requestAccess(request: PluginDataAccessRequest): Promise<PluginDataAccessStatus>;
++  /** Withdraw only the authenticated consumer's grant. Does not grant access. */
++  revokeAccess(request: PluginDataRevokeRequest): Promise<void>;
++  /** Owner-bound polling; no global events. Returns idempotent cleanup. */
++  subscribe<T = unknown>(request: PluginDataChangesRequest, onChanges: (page: PluginDataChangesPage<T>) => void | Promise<void>, options: PluginDataSubscribeOptions): () => void;
++}
+diff --git a/src/reminder-factory.ts b/src/reminder-factory.ts
+new file mode 100644
+index 0000000..71e19f0
+--- /dev/null
++++ b/src/reminder-factory.ts
+@@ -0,0 +1,75 @@
++import type { ReminderApi, ReminderConfigureRequest, ReminderItem, ReminderProvider, ReminderStatus, ReminderTransport } from './reminder-types';
++export * from './reminder-types';
++
++export class ReminderError extends Error {
++  constructor(public readonly code: string, message: string) { super(message); this.name = 'ReminderError'; }
++}
++function normalize(error: unknown): ReminderError {
++  if (error instanceof ReminderError) return error;
++  let value = error;
++  if (typeof value === 'string') { try { value = JSON.parse(value); } catch { /* Plain IPC error. */ } }
++  const record = value && typeof value === 'object' ? value as {code?: string; message?: string} : undefined;
++  return new ReminderError(typeof record?.code === 'string' ? record.code : 'unsupported', typeof record?.message === 'string' ? record.message : String(error));
++}
++function invalid(): never { throw new ReminderError('invalidRequest', 'Provide a provider, data type, enabled flag and valid reminder settings'); }
++function invalidResponse(): never { throw new ReminderError('invalidResponse', 'Invalid reminder response'); }
++function bounded(value: unknown, maximum: number): value is string { return typeof value === 'string' && [...value].length <= maximum; }
++function timestamp(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) >= 0; }
++function provider(value: unknown): value is ReminderProvider {
++  const item = value as ReminderProvider | undefined;
++  return !!item && bounded(item.source,64) && !!item.source && bounded(item.uuid,128) && !!item.uuid;
++}
++function validSettings(value: ReminderConfigureRequest): boolean {
++  return !!value && provider(value.provider) && bounded(value.type,128) && !!value.type && typeof value.enabled === 'boolean'
++    && (value.cooldownMs === undefined || Number.isSafeInteger(value.cooldownMs) && value.cooldownMs >= 30_000 && value.cooldownMs <= 86_400_000)
++    && (value.quietHours === undefined || !!value.quietHours && Number.isInteger(value.quietHours.start) && Number.isInteger(value.quietHours.end)
++      && value.quietHours.start >= 0 && value.quietHours.start < 1440 && value.quietHours.end >= 0 && value.quietHours.end < 1440);
++}
++function checkStatus(value: unknown): ReminderStatus {
++  const item = value as ReminderStatus;
++  if (!validSettings(item) || typeof item.cooldownMs !== 'number' || typeof item.available !== 'boolean'
++    || item.lastCheckedAt !== undefined && !timestamp(item.lastCheckedAt)
++    || item.lastDeliveredAt !== undefined && !timestamp(item.lastDeliveredAt)) invalidResponse();
++  return item;
++}
++function checkItem(value: unknown): ReminderItem {
++  const item = value as ReminderItem;
++  if (!item || !/^[a-f0-9]{64}$/.test(item.id) || !provider(item.provider) || !bounded(item.type,128) || !item.type
++    || !bounded(item.resourceId,1024) || !item.resourceId || !timestamp(item.dueAt) || !timestamp(item.deliveredAt)
++    || !bounded(item.title,120) || !bounded(item.body,500)) invalidResponse();
++  return item;
++}
++
++/** Dependency-free host IPC factory. Scheduling belongs to the running host;
++ * this API never creates a webview timer, grants access, or interprets note text. */
++export function createReminderApi(transport: ReminderTransport): ReminderApi {
++  const call = async (method: string, args?: Record<string, unknown>): Promise<unknown> => {
++    try { return await transport.invoke(`otools_host_plugin_reminders_${method}`,args); }
++    catch (error) { throw normalize(error); }
++  };
++  return {
++    async configure(options) {
++      if (!validSettings(options)) invalid();
++      // Explicit projection prevents caller-supplied owner identities from being
++      // forwarded. The host captures its source-aware native plugin identity.
++      const request: ReminderConfigureRequest = {provider:{source:options.provider.source,uuid:options.provider.uuid},type:options.type,enabled:options.enabled};
++      if (options.quietHours !== undefined) request.quietHours = {start:options.quietHours.start,end:options.quietHours.end};
++      if (options.cooldownMs !== undefined) request.cooldownMs = options.cooldownMs;
++      return checkStatus(await call('configure',{request}));
++    },
++    async status() {
++      const result = await call('status');
++      if (!Array.isArray(result) || result.length > 16) invalidResponse();
++      return result.map(checkStatus);
++    },
++    async pending() {
++      const result = await call('pending');
++      if (!Array.isArray(result) || result.length > 20) invalidResponse();
++      return result.map(checkItem);
++    },
++    async acknowledge(ids) {
++      if (!Array.isArray(ids) || ids.length > 20 || ids.some(id => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))) invalid();
++      await call('acknowledge',{ids:[...ids]});
++    },
++  };
++}
+diff --git a/src/reminder-types.ts b/src/reminder-types.ts
+new file mode 100644
+index 0000000..f8799a2
+--- /dev/null
++++ b/src/reminder-types.ts
+@@ -0,0 +1,40 @@
++export interface ReminderProvider { source: string; uuid: string }
++/** Local wall-clock minutes after midnight. Equal endpoints disable quiet time. */
++export interface ReminderQuietHours { start: number; end: number }
++export interface ReminderConfigureRequest {
++  provider: ReminderProvider;
++  type: 'notes.v1' | (string & {});
++  enabled: boolean;
++  quietHours?: ReminderQuietHours;
++  /** 30 seconds to 24 hours; host default is 5 minutes. */
++  cooldownMs?: number;
++}
++export interface ReminderStatus extends Omit<ReminderConfigureRequest, 'cooldownMs'> {
++  cooldownMs: number;
++  available: boolean;
++  lastCheckedAt?: number;
++  lastDeliveredAt?: number;
++}
++/** Private content returned only to the enrolled native-authenticated owner. */
++export interface ReminderItem {
++  id: string;
++  provider: ReminderProvider;
++  type: string;
++  resourceId: string;
++  dueAt: number;
++  title: string;
++  body: string;
++  deliveredAt: number;
++}
++export interface ReminderTransport {
++  invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
++}
++export interface ReminderApi {
++  /** Enroll a host-owned read watcher; this does not request or grant data access. */
++  configure(request: ReminderConfigureRequest): Promise<ReminderStatus>;
++  status(): Promise<ReminderStatus[]>;
++  /** Fresh, reauthorized reminders. Render as data, never as executable commands. */
++  pending(): Promise<ReminderItem[]>;
++  /** Acknowledge after showing the pet bubble to suppress the 30-second OS fallback. */
++  acknowledge(ids: string[]): Promise<void>;
++}
+diff --git a/tests/ai.test.ts b/tests/ai.test.ts
+new file mode 100644
+index 0000000..32fd36c
+--- /dev/null
++++ b/tests/ai.test.ts
+@@ -0,0 +1,125 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { createAiApi } from '../src/ai-factory';
++import type { AiCapabilities, AiEvent, AiRequest } from '../src/ai-types';
++
++const request: AiRequest = { messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }, { type: 'image', captureImageId: 'owned' }] }], maxTokens: 42 };
++const capabilities: AiCapabilities = { configured: true, provider: 'openai', model: 'host-model', streaming: true, cancellation: true, vision: 'unknown' };
++function fixture(reads: unknown[]) {
++  const commands: Array<[string, Record<string, unknown> | undefined]> = [];
++  const invoke = async (command: string, args?: Record<string, unknown>) => {
++    commands.push([command, args]);
++    switch (command) {
++      case 'otools_host_ai_capabilities': return capabilities;
++      case 'otools_host_ai_start': return { id: 'job' };
++      case 'otools_host_ai_read': return reads.shift();
++      case 'otools_host_ai_cancel': return;
++      default: throw new Error(`Misrouted command ${command}`);
++    }
++  };
++  return { api: createAiApi({ invoke }), commands };
++}
++
++afterEach(() => vi.useRealTimers());
++
++describe('host AI', () => {
++  it('routes only host-prefixed commands and passes typed messages without credential options', async () => {
++    const { api, commands } = fixture([{ id: 'job', events: [], done: false }]);
++    expect(await api.capabilities()).toEqual(capabilities);
++    expect(await api.start(request)).toEqual({ id: 'job' });
++    await api.read({ id: 'job', after: 0 });
++    await api.cancel({ id: 'job' });
++    expect(commands).toEqual([
++      ['otools_host_ai_capabilities', undefined], ['otools_host_ai_start', { request }],
++      ['otools_host_ai_read', { id: 'job', after: 0 }], ['otools_host_ai_cancel', { id: 'job' }],
++    ]);
++  });
++
++  it('consumes sequenced private polls and acknowledges the terminal result', async () => {
++    const { api, commands } = fixture([
++      { id: 'job', events: [{ sequence: 1, type: 'delta', text: 'one ' }], done: false },
++      { id: 'job', events: [{ sequence: 2, type: 'delta', text: 'two' }, { sequence: 3, type: 'done' }], done: true },
++      { id: 'job', events: [], done: true },
++    ]);
++    const events: AiEvent[] = [];
++    expect(await api.consume(request, { onEvent: event => events.push(event), pollIntervalMs: 0 })).toEqual({ id: 'job', text: 'one two' });
++    expect(events.map(event => event.sequence)).toEqual([1, 2, 3]);
++    expect(commands.filter(([command]) => command.endsWith('_read')).map(([, args]) => args?.after)).toEqual([0, 1, 3]);
++  });
++
++  it('does not reject unknown vision metadata and stops when host is not configured', async () => {
++    const { api } = fixture([{ id: 'job', events: [{ sequence: 1, type: 'done' }], done: true }, { id: 'job', events: [], done: true }]);
++    await expect(api.consume(request)).resolves.toEqual({ id: 'job', text: '' });
++    const blocked = createAiApi({ invoke: async command => {
++      if (command !== 'otools_host_ai_capabilities') throw new Error('must not start');
++      return { ...capabilities, configured: false };
++    } });
++    await expect(blocked.consume(request)).rejects.toMatchObject({ code: 'notConfigured' });
++  });
++
++  it.each([
++    { id: 'foreign', events: [], done: true },
++    { id: 'job', events: [{ sequence: 2, type: 'delta', text: 'gap' }], done: false },
++    { id: 'job', events: [{ sequence: 1, type: 'done' }, { sequence: 2, type: 'delta', text: 'late' }], done: true },
++    { id: 'job', events: [], done: true },
++  ])('rejects malformed batches and cancels the job', async result => {
++    const { api, commands } = fixture([result]);
++    await expect(api.consume(request)).rejects.toMatchObject({ code: 'invalidResponse' });
++    expect(commands.some(([command]) => command === 'otools_host_ai_cancel')).toBe(true);
++  });
++
++  it('surfaces provider errors and host cancellation as terminal failures', async () => {
++    for (const [type, code] of [['error', 'providerFailed'], ['cancelled', 'cancelled']] as const) {
++      const { api } = fixture([{ id: 'job', events: [{ sequence: 1, type, ...(type === 'error' ? { error: code } : {}) }], done: true }]);
++      await expect(api.consume(request)).rejects.toMatchObject({ code });
++    }
++  });
++
++  it('aborts promptly during a stalled start, cancels the late id, and never dispatches callbacks', async () => {
++    let resolveStart!: (value: unknown) => void;
++    const calls: string[] = [];
++    const callback = vi.fn();
++    const controller = new AbortController();
++    const api = createAiApi({ invoke: async command => {
++      calls.push(command);
++      if (command.endsWith('_capabilities')) return capabilities;
++      if (command.endsWith('_start')) return new Promise(resolve => { resolveStart = resolve; });
++    } });
++    const pending = api.consume(request, { signal: controller.signal, onEvent: callback });
++    await vi.waitFor(() => expect(resolveStart).toBeTypeOf('function'));
++    controller.abort();
++    await expect(pending).rejects.toMatchObject({ code: 'cancelled' });
++    resolveStart({ id: 'late' });
++    await vi.waitFor(() => expect(calls).toContain('otools_host_ai_cancel'));
++    expect(callback).not.toHaveBeenCalled();
++  });
++
++  it('aborts a stalled poll without waiting for IPC and ignores its late response', async () => {
++    let resolveRead!: (value: unknown) => void;
++    const controller = new AbortController();
++    const callback = vi.fn();
++    const calls: string[] = [];
++    const api = createAiApi({ invoke: async command => {
++      calls.push(command);
++      if (command.endsWith('_capabilities')) return capabilities;
++      if (command.endsWith('_start')) return { id: 'job' };
++      if (command.endsWith('_read')) return new Promise(resolve => { resolveRead = resolve; });
++    } });
++    const pending = api.consume(request, { signal: controller.signal, onEvent: callback });
++    await vi.waitFor(() => expect(resolveRead).toBeTypeOf('function'));
++    controller.abort();
++    await expect(pending).rejects.toMatchObject({ code: 'cancelled' });
++    resolveRead({ id: 'job', events: [{ sequence: 1, type: 'delta', text: 'late' }], done: false });
++    await Promise.resolve();
++    expect(callback).not.toHaveBeenCalled();
++    expect(calls).toContain('otools_host_ai_cancel');
++  });
++
++  it('does not start an already aborted request and cancels when a consumer callback throws', async () => {
++    const { api, commands } = fixture([{ id: 'job', events: [{ sequence: 1, type: 'delta', text: 'x' }], done: false }]);
++    const controller = new AbortController(); controller.abort();
++    await expect(api.consume(request, { signal: controller.signal })).rejects.toMatchObject({ code: 'cancelled' });
++    expect(commands).toEqual([]);
++    await expect(api.consume(request, { onEvent() { throw new Error('callback'); } })).rejects.toThrow('callback');
++    expect(commands.some(([command]) => command.endsWith('_cancel'))).toBe(true);
++  });
++});
+diff --git a/tests/capture-injection.test.ts b/tests/capture-injection.test.ts
+index ac44e9e..51a790d 100644
+--- a/tests/capture-injection.test.ts
++++ b/tests/capture-injection.test.ts
+@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
+ import { describe, expect, it, vi } from 'vitest';
+ import ts from 'typescript';
+ 
+-const embeddedPath = new URL('../../../src/platform/runtime/otools/embedded-runtime.js', import.meta.url);
++const embeddedPath = process.env.OTOOLS_HOST_ROOT
++  ? `${process.env.OTOOLS_HOST_ROOT}/src/platform/runtime/otools/embedded-runtime.js`
++  : new URL('../../../src/platform/runtime/otools/embedded-runtime.js', import.meta.url);
+ const embedded = readFileSync(embeddedPath, 'utf8');
+ function load(invoke: (command: string, args?: unknown) => Promise<unknown>) {
+   const target = { __TAURI_INTERNALS__: { invoke }, location: { search: '' } } as any;
+diff --git a/tests/observation.test.ts b/tests/observation.test.ts
+new file mode 100644
+index 0000000..d21b256
+--- /dev/null
++++ b/tests/observation.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it } from 'vitest';
++import { createObservationApi } from '../src/observation-factory';
++const target = { kind: 'screen' as const, displayId: '1' };
++const active = { id: 'session', state: 'active', target, intervalMs: 60_000 };
++const image = { imageId: 'image', mimeType: 'image/png', width: 100, height: 100, expiresAt: 9_999_999_999_999 };
++describe('host-owned observation', () => {
++  it('requires explicit targets and rejects aggressive intervals without invoking the host', async () => {
++    const calls: string[] = [];
++    const api = createObservationApi({ invoke: async command => { calls.push(command); return active; } });
++    await expect(api.request({ target, intervalMs: 1 })).rejects.toMatchObject({ code: 'invalidRequest' });
++    await expect(api.request({ target: { kind: 'window', windowId: '' } })).rejects.toMatchObject({ code: 'invalidRequest' });
++    expect(calls).toEqual([]);
++  });
++  it('defaults to sixty seconds and returns pending consent without auto-approval or capture', async () => {
++    const calls: unknown[] = [];
++    const api = createObservationApi({ invoke: async (command, args) => {
++      calls.push([command, args]); return { ...active, state: 'pending' };
++    } });
++    expect((await api.request({ target })).state).toBe('pending');
++    expect(calls).toEqual([['otools_host_observation_request', { options: { target, intervalMs: 60_000 } }]]);
++  });
++  it('releases a late image when stop races capture completion', async () => {
++    let deliver!: (value: unknown) => void;
++    const released: string[] = [];
++    const api = createObservationApi({ invoke: async (command, args) => {
++      if (command.endsWith('_capture')) return new Promise(resolve => { deliver = resolve; });
++      if (command.endsWith('_release')) released.push(String(args?.imageId));
++      return active;
++    } });
++    const pending = api.capture({ id: 'session' });
++    await api.stop({ id: 'session' });
++    deliver(image);
++    await expect(pending).rejects.toMatchObject({ code: 'stopped' });
++    expect(released).toEqual(['image']);
++  });
++  it('rechecks live host status before handing an image to inference', async () => {
++    const released: string[] = [];
++    const api = createObservationApi({ invoke: async (command, args) => {
++      if (command.endsWith('_capture')) return image;
++      if (command.endsWith('_status')) return { ...active, state: 'stopped' };
++      if (command.endsWith('_release')) released.push(String(args?.imageId));
++    } });
++    await expect(api.capture({ id: 'session' })).rejects.toMatchObject({ code: 'stopped' });
++    expect(released).toEqual(['image']);
++  });
++  it('does not swallow cross-owner denial and returns successful owned image', async () => {
++    const api = createObservationApi({ invoke: async command => {
++      if (command.endsWith('_capture')) return image;
++      if (command.endsWith('_status')) return active;
++      throw { code: 'forbidden', message: 'Another caller' };
++    } });
++    expect(await api.capture({ id: 'session' })).toEqual(image);
++    await expect(api.targets()).rejects.toMatchObject({ code: 'forbidden' });
++  });
++});
+diff --git a/tests/plugin-data.test.ts b/tests/plugin-data.test.ts
+new file mode 100644
+index 0000000..6df715e
+--- /dev/null
++++ b/tests/plugin-data.test.ts
+@@ -0,0 +1,75 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { createPluginDataApi, PluginDataError } from '../src/plugin-data-factory';
++import type { PluginDataTransport } from '../src/plugin-data-types';
++
++const provider = { source: 'market', uuid: 'notes' };
++afterEach(() => vi.useRealTimers());
++
++describe('plugin data transport boundary', () => {
++  it('uses camelCase request envelopes without claiming provider identity for writes', async () => {
++    const calls: Array<[string, Record<string, unknown> | undefined]> = [];
++    const transport: PluginDataTransport = { invoke: async (command, args) => { calls.push([command, args]); return null; } };
++    const data = createPluginDataApi(transport);
++    await data.list({ type: 'note' });
++    await data.get({ provider, type: 'note', id: 'one' });
++    await data.put({ type: 'note', id: 'one', data: { text: 'hi' }, privateData: { x: 10 }, expectedRevision: 0 });
++    await data.remove({ type: 'note', id: 'one', expectedRevision: 1 });
++    await data.requestAccess({ provider, type: 'note', subscribe: true });
++    await data.revokeAccess({ provider, type: 'note' });
++    expect(calls).toEqual([
++      ['otools_host_plugin_data_list', { request: { type: 'note' } }],
++      ['otools_host_plugin_data_get', { request: { provider, type: 'note', id: 'one' } }],
++      ['otools_host_plugin_data_put', { request: { type: 'note', id: 'one', data: { text: 'hi' }, privateData: { x: 10 }, expectedRevision: 0 } }],
++      ['otools_host_plugin_data_remove', { request: { type: 'note', id: 'one', expectedRevision: 1 } }],
++      ['otools_host_plugin_data_request_access', { request: { provider, type: 'note', subscribe: true } }],
++      ['otools_host_plugin_data_revoke_access', { request: { provider, type: 'note' } }],
++    ]);
++  });
++  it('preserves structured conflict and revoked-grant errors', async () => {
++    const data = createPluginDataApi({ invoke: async () => { throw JSON.stringify({ code: 'conflict', message: 'Resource revision has changed' }); } });
++    await expect(data.put({ type: 'note', id: 'one', data: null, expectedRevision: 1 })).rejects.toMatchObject({ name: 'PluginDataError', code: 'conflict' });
++  });
++  it('rejects unsafe or missing revisions before invoking the host', async () => {
++    let invoked = false;
++    const data = createPluginDataApi({ invoke: async () => { invoked = true; } });
++    await expect(data.remove({ type: 'note', id: 'one', expectedRevision: Number.MAX_SAFE_INTEGER + 1 })).rejects.toMatchObject({ code: 'invalidRequest' });
++    expect(invoked).toBe(false);
++  });
++});
++
++describe('owned change polling', () => {
++  it('uses returned cursor, drains backlog, and stops immediately on revocation', async () => {
++    vi.useFakeTimers();
++    const afters: unknown[] = []; let calls = 0;
++    const data = createPluginDataApi({ invoke: async (_command, args) => {
++      afters.push((args?.request as { after: string }).after); calls++;
++      if (calls === 3) throw { code: 'permissionDenied', message: 'revoked' };
++      return { items: [], after: calls === 1 ? 'second' : 'third', hasMore: calls === 1 };
++    } });
++    const pages: string[] = []; const errors: PluginDataError[] = [];
++    data.subscribe({ provider, type: 'note', after: 'first' }, page => { pages.push(page.after); }, { intervalMs: 1000, onError: error => errors.push(error) });
++    await vi.advanceTimersByTimeAsync(1);
++    expect(pages).toEqual(['second', 'third']);
++    await vi.advanceTimersByTimeAsync(1000);
++    expect(afters).toEqual(['first', 'second', 'third']);
++    expect(errors[0]?.code).toBe('permissionDenied');
++    await vi.advanceTimersByTimeAsync(10000); expect(calls).toBe(3);
++  });
++  it('suppresses in-flight results after cleanup and does not overlap requests', async () => {
++    vi.useFakeTimers();
++    let resolve!: (value: unknown) => void; let calls = 0;
++    const data = createPluginDataApi({ invoke: () => { calls++; return new Promise(r => { resolve = r; }); } });
++    const received: unknown[] = [];
++    const stop = data.subscribe({ type: 'note', after: 'first' }, page => { received.push(page); }, { intervalMs: 250, onError: () => {} });
++    await vi.advanceTimersByTimeAsync(5000); expect(calls).toBe(1);
++    stop(); stop(); resolve({ items: [], after: 'late', hasMore: true });
++    await vi.advanceTimersByTimeAsync(10000);
++    expect(received).toEqual([]); expect(calls).toBe(1);
++  });
++  it('does not start an already-aborted subscription', async () => {
++    const abort = new AbortController(); abort.abort(); let calls = 0;
++    const data = createPluginDataApi({ invoke: async () => { calls++; } });
++    data.subscribe({ type: 'note', after: 'first' }, () => {}, { signal: abort.signal, onError: () => {} });
++    await Promise.resolve(); expect(calls).toBe(0);
++  });
++});
+diff --git a/tests/reminder-factory.test.ts b/tests/reminder-factory.test.ts
+new file mode 100644
+index 0000000..6f01bca
+--- /dev/null
++++ b/tests/reminder-factory.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, it } from 'vitest';
++import { createReminderApi, ReminderError } from '../src/reminder-factory';
++
++const provider = { source: 'installed', uuid: 'notes' };
++const status = { provider, type: 'notes.v1', enabled: true, cooldownMs: 300_000, available: true };
++const id = 'a'.repeat(64);
++
++describe('reminder factory', () => {
++  it('configures only a provider-scoped watcher without caller-supplied ownership', async () => {
++    const calls: unknown[] = [];
++    const api = createReminderApi({ invoke: async (command, args) => { calls.push([command,args]); return status; } });
++    const request = { provider, type: 'notes.v1', enabled: true, quietHours: {start:1320,end:420} };
++    expect(await api.configure(request)).toEqual(status);
++    expect(calls).toEqual([['otools_host_plugin_reminders_configure',{request}]]);
++  });
++  it('rejects ambiguous settings before invoking the host', async () => {
++    const api = createReminderApi({ invoke: async () => { throw new Error('unexpected invoke'); } });
++    await expect(api.configure({provider,type:'notes.v1',enabled:true,quietHours:{start:1440,end:0}})).rejects.toMatchObject({code:'invalidRequest'});
++    await expect(api.configure({provider,type:'notes.v1',enabled:true,cooldownMs:0})).rejects.toMatchObject({code:'invalidRequest'});
++  });
++  it('preserves typed broker revocation errors rather than silently making a local timer', async () => {
++    const api = createReminderApi({ invoke: async () => { throw {code:'forbidden',message:'Grant revoked'}; } });
++    await expect(api.pending()).rejects.toMatchObject({code:'forbidden',message:'Grant revoked'});
++    await expect(api.status()).rejects.toBeInstanceOf(ReminderError);
++  });
++  it('returns private pending data and acknowledges the exact owned delivery IDs', async () => {
++    const calls: unknown[] = [];
++    const item = {id,provider,type:'notes.v1',resourceId:'note',dueAt:1_794_304_800_000,title:'Planning',body:'[notes / notes.v1] Call',deliveredAt:1_794_304_800_000};
++    const api = createReminderApi({ invoke: async (command,args) => {
++      calls.push([command,args]);
++      return command.endsWith('_pending') ? [item] : command.endsWith('_status') ? [status] : undefined;
++    } });
++    expect(await api.pending()).toEqual([item]);
++    expect(await api.status()).toEqual([status]);
++    await api.acknowledge([id]);
++    expect(calls).toEqual([['otools_host_plugin_reminders_pending',undefined],['otools_host_plugin_reminders_status',undefined],['otools_host_plugin_reminders_acknowledge',{ids:[id]}]]);
++  });
++  it('rejects malformed host feed rather than displaying arbitrary unbounded data', async () => {
++    const api = createReminderApi({ invoke: async () => [{id,body:'x'.repeat(501)}] });
++    await expect(api.pending()).rejects.toMatchObject({code:'invalidResponse'});
++  });
++  it('rejects invalid acknowledgement IDs without sending them to another owner', async () => {
++    const api = createReminderApi({ invoke: async () => { throw new Error('unexpected invoke'); } });
++    await expect(api.acknowledge(['other-owner'])).rejects.toMatchObject({code:'invalidRequest'});
++  });
++});
+diff --git a/tests/service-injection.test.ts b/tests/service-injection.test.ts
+new file mode 100644
+index 0000000..9113cfc
+--- /dev/null
++++ b/tests/service-injection.test.ts
+@@ -0,0 +1,36 @@
++// @vitest-environment node
++import { readFileSync } from 'node:fs';
++import { describe, expect, it } from 'vitest';
++
++const path = process.env.OTOOLS_HOST_ROOT
++  ? `${process.env.OTOOLS_HOST_ROOT}/src/platform/runtime/otools/embedded-runtime.js`
++  : new URL('../../../src/platform/runtime/otools/embedded-runtime.js', import.meta.url);
++const embedded = readFileSync(path, 'utf8');
++
++describe('plain WebView companion services', () => {
++  it('routes typed services to the host without a native plugin library', async () => {
++    const calls: unknown[] = [];
++    const target: any = { location: { search: '' }, __TAURI_INTERNALS__: {
++      invoke: async (command: string, args: unknown) => {
++        calls.push([command, args]);
++        if (command.endsWith('capabilities')) return { configured: true, streaming: true, cancellation: true, vision: 'unknown' };
++        if (command.endsWith('targets')) return { screens: [], windows: [] };
++        return [];
++      },
++    } };
++    target.parent = target; target.top = target;
++    new Function('window', embedded)(target);
++    expect(target.otools.ai).toBeDefined();
++    expect(target.otools.data).toBeDefined();
++    expect(target.otools.observation).toBeDefined();
++    expect(target.otools.reminders).toBeDefined();
++    await target.otools.ai.capabilities();
++    await target.otools.data.discover();
++    await target.otools.observation.targets();
++    await target.otools.reminders.status();
++    expect(calls.map((call: any) => call[0])).toEqual([
++      'otools_host_ai_capabilities', 'otools_host_plugin_data_discover',
++      'otools_host_observation_targets', 'otools_host_plugin_reminders_status',
++    ]);
++  });
++});
+diff --git a/vite.config.ts b/vite.config.ts
+index d35c159..dc727a2 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -11,6 +11,10 @@ export default defineConfig({
+         runtime: "src/runtime.ts",
+         capture: "src/capture.ts",
+         "capture-factory": "src/capture-factory.ts",
++        "ai-factory": "src/ai-factory.ts",
++        "plugin-data-factory": "src/plugin-data-factory.ts",
++        "observation-factory": "src/observation-factory.ts",
++        "reminder-factory": "src/reminder-factory.ts",
+         "popup-manager": "src/popup-manager.ts",
+         "native-event-bridge": "src/native-event-bridge.ts",
+         dialog: "src/dialog.ts",

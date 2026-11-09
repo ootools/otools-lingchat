@@ -1,0 +1,22 @@
+{
+  "uuid": "otools-lingchat",
+  "packid": "otools-lingchat",
+  "displayName": "LingChat Companion",
+  "displayNameCN": "灵伴 AI 助手",
+  "developerName": "OTools",
+  "summary": "基于 LingChat 的独立桌宠助手，使用 Otools AI 与授权的插件数据。",
+  "version": "0.1.0",
+  "entry": "dist/index.html",
+  "devUrl": "http://127.0.0.1:5995",
+  "logo": "logo.svg",
+  "icon": "🐱",
+  "key": ["灵伴", "桌宠", "助手", "lingchat", "companion"],
+  "screenCapture": true,
+  "openMode": "custom",
+  "pluginData": { "provides": [], "consumes": ["notes.v1"] },
+  "customWindow": {
+    "width": 380, "height": 520,
+    "transparent": true, "decorations": false, "shadow": false,
+    "resizable": true, "alwaysOnTop": true, "skipTaskbar": true
+  }
+}

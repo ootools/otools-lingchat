@@ -7,6 +7,7 @@ const paths: Record<string, string> = {
   story: 'M12 5C7 2 3 4 2 5v15c3-2 6-2 10 0 4-2 7-2 10 0V5c-3-2-6-2-10 0Zm0 0v15',
   memory: 'M9 4a4 4 0 0 0-6 4 4 4 0 0 0-1 7 4 4 0 0 0 7 4V4Zm6 0a4 4 0 0 1 6 4 4 4 0 0 1 1 7 4 4 0 0 1-7 4V4ZM5 8h4m-5 7h5m6-7h4m-4 7h5',
   notes: 'M5 3h14v18H5V3Zm4 5h6m-6 4h6m-6 4h3',
+  connections: 'M9 7V3m6 4V3M6 7h12v4a6 6 0 0 1-12 0V7Zm6 10v4m-3 0h6',
   settings: 'M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1 1-3Zm3 6a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z',
   plus: 'M12 5v14M5 12h14', close: 'm6 6 12 12M6 18 18 6', chevron: 'm9 5 7 7-7 7', down: 'm6 9 6 6 6-6',
   send: 'm4 11 16-8-7 18-2-8-7-2Zm7 2 9-10', stop: 'M6 6h12v12H6z',

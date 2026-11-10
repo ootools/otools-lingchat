@@ -13,7 +13,7 @@ import Icon from './components/Icon.vue';
 import Mascot from './components/Mascot.vue';
 import MemoryEditor from './components/MemoryEditor.vue';
 import StoryPanel from './components/StoryPanel.vue';
-import NotesPanel from './components/NotesPanel.vue';
+import ConnectionsPanel from './components/ConnectionsPanel.vue';
 import EmotionModelPanel from './components/EmotionModelPanel.vue';
 
 const c = useCompanion();
@@ -25,7 +25,7 @@ const {
   observationStatus, targets, targetValue, externalContext,
 } = c;
 const explicitPreview = isExplicitPreview(window.location.search);
-const navigation = ['chat', 'saves', 'characters', 'story', 'memory', 'notes', 'settings'] as const;
+const navigation = ['chat', 'saves', 'characters', 'story', 'memory', 'connections', 'settings'] as const;
 const memorySections = Object.keys(MEMORY_LIMITS) as MemorySection[];
 const acting = ref(false);
 const newSaveOpen = ref(false);
@@ -186,7 +186,7 @@ onBeforeUnmount(() => {
             <strong>{{ characterName }}</strong><p>{{ subtitle }}</p>
             <span class="status-pill"><span class="status-dot" :class="{ muted: !availableAi }" />{{ explicitPreview ? t('preview') : availableAi ? t('online') : t('unavailable') }}</span>
           </div>
-          <nav class="navigation" :aria-label="t('app')"><button v-for="item in navigation" :key="item" :class="{ active: tab === item }" :aria-current="tab === item ? 'page' : undefined" @click="selectTab(item)"><Icon :name="item" :size="19" /><span>{{ t(item) }}</span><span v-if="item === 'notes' && externalContext" class="nav-dot" /></button></nav>
+          <nav class="navigation" :aria-label="t('app')"><button v-for="item in navigation" :key="item" :class="{ active: tab === item }" :aria-current="tab === item ? 'page' : undefined" @click="selectTab(item)"><Icon :name="item" :size="19" /><span>{{ t(item) }}</span><span v-if="item === 'connections' && externalContext" class="nav-dot" /></button></nav>
           <div class="sidebar-footer"><Icon name="saves" :size="17" /><div><span>{{ t('currentSave') }}</span><strong :title="currentSave?.name">{{ currentSave?.name || t('loading') }}</strong></div></div>
         </aside>
 
@@ -239,7 +239,7 @@ onBeforeUnmount(() => {
               <fieldset class="memory-grid" :disabled="!canEdit"><MemoryEditor v-for="(section, index) in memorySections" :key="`${saveId}:${roleId}:${section}`" :title="t(section)" :value="role.memory.data[section]" :limit="MEMORY_LIMITS[section]" :save-label="t('save')" :index="index" @save="value => run(() => c.editMemory(section, value))" /></fieldset><p class="privacy-note"><Icon name="shield" :size="15" />{{ t('memoryPrivacy') }}</p>
             </template>
 
-            <NotesPanel v-else-if="tab === 'notes'" :t="t" @context="useNotesContext" @error="c.fail" @bubble="bubble = $event" />
+            <ConnectionsPanel v-else-if="tab === 'connections'" :t="t" @context="useNotesContext" @error="c.fail" @bubble="bubble = $event" />
 
             <template v-else-if="tab === 'settings'">
               <div class="section-intro"><span class="eyebrow">{{ t('companion') }}</span><h2>{{ t('settings') }}</h2><p>{{ t('tagline') }}</p></div>

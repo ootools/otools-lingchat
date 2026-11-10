@@ -87,6 +87,12 @@ img { max-width: 100%; }
 .pet-caption span { display: flex; align-items: center; gap: 4px; font-size: 10px; color: #94a180; }
 .compact-composer { display: flex; align-items: center; gap: 5px; width: 100%; padding: 5px 6px 5px 10px; border: 1px solid #e5e8dc; border-radius: 14px; background: #fffef9f7; box-shadow: 0 4px 18px #3a4a3008; }
 .compact-composer input { flex: 1; height: 34px; padding: 5px 4px; border: 0; background: transparent; font-size: 12px; box-shadow: none; }
+.composer-collapse { flex: none; }
+/* The toolbar appears only while the cursor is on the header (or keyboard-focused). */
+.pet-window .window-actions { opacity: 0; pointer-events: none; transition: opacity .18s ease; }
+.pet-header:hover .window-actions, .pet-header:focus-within .window-actions { opacity: 1; pointer-events: auto; }
+.pet-fab { display: inline-flex; align-items: center; justify-content: center; width: 38px; height: 38px; flex: none; border: 1px solid #e5e8dc; border-radius: 50%; background: #fffef9f7; color: #5c6b4f; box-shadow: 0 4px 18px #3a4a3008; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; }
+.pet-fab:hover { transform: translateY(-1px); box-shadow: 0 6px 22px #3a4a3014; }
 .send-button { width: 34px; height: 34px; display: grid; place-items: center; color: #fffef7; background: var(--sage); border-radius: 10px; }
 .send-button:hover:not(:disabled) { background: var(--sage-deep); }
 .compact-notice { flex-shrink: 0; max-width: 100%; margin-top: 7px; padding: 4px 8px; font-size: 10px; line-height: 1.5; color: #7c8872; background: #faf9f2e8; border-radius: 7px; text-align: center; }

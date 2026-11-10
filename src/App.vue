@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getCurrentWindow, cursorPosition } from '@tauri-apps/api/window';
 import { useCompanion } from './composables/useCompanion';
 import { languages } from './composables/i18n';
 import { getHost, isExplicitPreview, nativeWindow } from './host/bridge';
@@ -27,6 +27,7 @@ const {
 const explicitPreview = isExplicitPreview(window.location.search);
 const navigation = ['chat', 'saves', 'characters', 'story', 'memory', 'connections', 'settings'] as const;
 const memorySections = Object.keys(MEMORY_LIMITS) as MemorySection[];
+const composerOpen = ref(false);
 const acting = ref(false);
 const newSaveOpen = ref(false);
 const newSaveName = ref('');
@@ -89,6 +90,8 @@ function onComposerKeydown(event: KeyboardEvent) {
 async function togglePanel() {
   if (!explicitPreview && !host.value) { expanded.value = !expanded.value; return; }
   await run(c.toggleExpanded);
+  if (!expanded.value) startCursorManager();
+  else await setNativeInteractive(true);
 }
 function selectTab(next: typeof navigation[number]) {
   tab.value = next;
@@ -117,14 +120,65 @@ function date(value: string) { return new Date(value).toLocaleDateString(locale.
 function time(value: string) { return new Date(value).toLocaleTimeString(locale.value, { hour: '2-digit', minute: '2-digit' }); }
 function messageCount(save: SaveRecord) { return Object.values(save.roles).reduce((count, item) => count + item.messages.length, 0); }
 async function checkAi() { await run(async () => { await c.checkAi(); aiStatus.value = toast.value; }); }
-async function restoreCursor() {
-  if (!hasNative.value) return;
+/** The transparent window must not block other apps: it starts click-through and
+ *  only becomes interactive while the cursor is over an actual hit zone. */
+const CURSOR_POLL_MS = 120;
+let hitPoll: ReturnType<typeof setInterval> | undefined;
+let nativeInteractive = true;
+let bounds: { x: number; y: number; scale: number; ready: boolean } = { x: 0, y: 0, scale: 1, ready: false };
+function hitZones(): Array<{ x: number; y: number; w: number; h: number }> {
+  const zones: Array<{ x: number; y: number; w: number; h: number }> = [];
+  for (const node of document.querySelectorAll('[data-pet-hit]')) {
+    const rect = node.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      zones.push({ x: rect.x - 8, y: rect.y - 8, w: rect.width + 16, h: rect.height + 16 });
+    }
+  }
+  return zones;
+}
+async function setNativeInteractive(next: boolean) {
+  if (nativeInteractive === next || !hasNative.value || explicitPreview) return;
+  nativeInteractive = next;
+  try { await getCurrentWindow().setIgnoreCursorEvents(!next); }
+  catch { nativeInteractive = !next; }
+}
+async function syncCursor() {
+  if (!hasNative.value || explicitPreview || expanded.value || !active.value) return;
   const native = getCurrentWindow();
-  if (typeof native.setIgnoreCursorEvents === 'function') await native.setIgnoreCursorEvents(false);
+  if (!bounds.ready) {
+    try {
+      const [origin, scale] = await Promise.all([native.outerPosition(), native.scaleFactor()]);
+      bounds = { x: origin.x, y: origin.y, scale: scale || 1, ready: true };
+    } catch { return; }
+  }
+  const zones = hitZones();
+  let hovering = false;
+  if (zones.length) {
+    try {
+      const cursor = await cursorPosition();
+      const x = (cursor.x - bounds.x) / bounds.scale;
+      const y = (cursor.y - bounds.y) / bounds.scale;
+      hovering = zones.some(zone => x >= zone.x && x <= zone.x + zone.w && y >= zone.y && y <= zone.y + zone.h);
+    } catch { return; }
+  }
+  await setNativeInteractive(hovering);
+}
+function startCursorManager() {
+  if (!hasNative.value || explicitPreview) return;
+  nativeInteractive = true;
+  void getCurrentWindow().setIgnoreCursorEvents(true).then(() => { nativeInteractive = false; }).catch(c.fail);
+  hitPoll = setInterval(() => { void syncCursor(); }, CURSOR_POLL_MS);
+  const invalidate = () => { bounds.ready = false; };
+  void getCurrentWindow().onMoved(invalidate).catch(c.fail);
+  void getCurrentWindow().onResized(invalidate).catch(c.fail);
+}
+function openComposer() {
+  composerOpen.value = true;
+  void nextTick(() => composer.value?.focus());
 }
 async function reopen() {
   if (disposed) return;
-  await c.attempt(async () => { await c.reopen(); await c.refresh(); await restoreCursor(); });
+  await c.attempt(async () => { await c.reopen(); await c.refresh(); startCursorManager(); });
 }
 async function close() { turn++; pendingUser.value = ''; await c.attempt(c.close); }
 
@@ -134,11 +188,12 @@ onMounted(() => {
     void listen('otools:custom-open', () => { void reopen(); }).then(stop => {
       if (disposed) stop(); else unlisten = stop;
     }).catch(c.fail);
-    void restoreCursor().catch(c.fail);
+    startCursorManager();
   }
 });
 onBeforeUnmount(() => {
   disposed = true; turn++; unlisten?.();
+  if (hitPoll) { clearInterval(hitPoll); hitPoll = undefined; }
   void c.dispose().catch(c.fail);
 });
 </script>
@@ -146,7 +201,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="app-shell" :class="{ expanded, 'reduced-motion': reduceMotion }" :style="petStyle" :dir="direction" :lang="locale">
     <section v-if="active && !expanded" class="pet-window" :aria-label="t('companion')">
-      <header class="pet-header drag-handle" :title="t('drag')" @pointerdown="dragWindow">
+      <header class="pet-header drag-handle" data-pet-hit :title="t('drag')" @pointerdown="dragWindow">
         <span class="pet-brand"><Icon name="characters" :size="17" />{{ t('app') }}<span class="status-dot" :class="{ muted: !availableAi }" /></span>
         <div class="window-actions">
           <button class="icon-button" :class="{ selected: topmost && hasNative }" :disabled="!hasNative || loading || acting" :aria-label="t('topmost')" :aria-pressed="topmost && hasNative" :title="t('topmost')" @click="toggleTopmost"><Icon name="pin" :size="16" /></button>
@@ -154,16 +209,18 @@ onBeforeUnmount(() => {
           <button class="icon-button close-button" :disabled="loading || (!hasNative && !explicitPreview)" :aria-label="t('close')" :title="t('close')" @click="close"><Icon name="close" :size="17" /></button>
         </div>
       </header>
-      <div class="pet-bubble" role="status" aria-live="polite"><span class="bubble-spark"><Icon name="sparkle" :size="15" /></span><p>{{ loading ? t('loading') : bubble || t('welcome') }}</p><span v-if="busy" class="typing-dots" aria-hidden="true"><i /><i /><i /></span></div>
-      <button class="pet-avatar" :disabled="loading || acting" :aria-label="t('pet')" :title="t('pet')" @click="run(c.pet)">
+      <div class="pet-bubble" data-pet-hit role="status" aria-live="polite"><span class="bubble-spark"><Icon name="sparkle" :size="15" /></span><p>{{ loading ? t('loading') : bubble || t('welcome') }}</p><span v-if="busy" class="typing-dots" aria-hidden="true"><i /><i /><i /></span></div>
+      <button class="pet-avatar" data-pet-hit :disabled="loading || acting" :aria-label="t('pet')" :title="t('pet')" @click="run(c.pet)">
         <img v-if="avatarVisible" :src="avatar" :alt="characterName" class="imported-avatar" @error="avatarBroken = true" />
         <Mascot v-else :emotion="emotion" compact />
       </button>
-      <div class="pet-caption"><strong>{{ characterName }}</strong><span><Icon name="heart" :size="12" />{{ role?.bond ?? 0 }}</span></div>
-      <form class="compact-composer" @submit.prevent="submit">
-        <input v-model="draft" :aria-label="t('input')" :placeholder="t('input')" maxlength="5000" :disabled="loading" @keydown="onComposerKeydown" />
+      <div class="pet-caption" data-pet-hit><strong>{{ characterName }}</strong><span><Icon name="heart" :size="12" />{{ role?.bond ?? 0 }}</span></div>
+      <button v-if="!composerOpen" class="pet-fab" data-pet-hit :aria-label="t('chat')" :title="t('chat')" @click="openComposer"><Icon name="chat" :size="18" /></button>
+      <form v-else class="compact-composer" data-pet-hit @submit.prevent="submit">
+        <input ref="composer" v-model="draft" :aria-label="t('input')" :placeholder="t('input')" maxlength="5000" :disabled="loading" @keydown="onComposerKeydown" />
         <button v-if="busy" type="button" class="send-button" :aria-label="t('stop')" :title="t('stop')" @click="stopReply"><Icon name="stop" :size="17" /></button>
         <button v-else type="submit" class="send-button" :disabled="!canSend" :aria-label="t('send')" :title="t('send')"><Icon name="send" :size="18" /></button>
+        <button type="button" class="icon-button composer-collapse" :aria-label="t('close')" :title="t('close')" @click="composerOpen = false"><Icon name="down" :size="16" /></button>
       </form>
       <p v-if="explicitPreview" class="compact-notice">{{ t('preview') }}</p>
       <p v-else-if="!host?.ai" class="compact-notice">{{ t('noHost') }}</p>
@@ -255,7 +312,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
     <div v-else-if="explicitPreview" class="closed-state"><Icon name="characters" :size="28" /><p>{{ t('close') }}</p><button class="button primary" @click="reopen">{{ t('resume') }}</button></div>
-    <div v-if="error" class="feedback error-feedback" role="alert"><Icon name="shield" :size="17" /><p>{{ error }}</p><button class="icon-button" :aria-label="t('close')" @click="error = ''"><Icon name="close" :size="16" /></button></div>
-    <div v-if="toast" class="feedback toast-feedback" role="status"><Icon name="check" :size="17" /><p>{{ toast }}</p><button class="icon-button" :aria-label="t('close')" @click="toast = ''"><Icon name="close" :size="15" /></button></div>
+    <div v-if="error" class="feedback error-feedback" data-pet-hit role="alert"><Icon name="shield" :size="17" /><p>{{ error }}</p><button class="icon-button" :aria-label="t('close')" @click="error = ''"><Icon name="close" :size="16" /></button></div>
+    <div v-if="toast" class="feedback toast-feedback" data-pet-hit role="status"><Icon name="check" :size="17" /><p>{{ toast }}</p><button class="icon-button" :aria-label="t('close')" @click="toast = ''"><Icon name="close" :size="15" /></button></div>
   </div>
 </template>

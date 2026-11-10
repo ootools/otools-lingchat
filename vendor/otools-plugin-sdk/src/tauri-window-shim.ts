@@ -108,6 +108,10 @@ export class Window {
 
 export function getCurrentWindow(): Window { return new Window(resolveWindowLabel()); }
 
+export async function cursorPosition(): Promise<PhysicalPosition> {
+  return new PhysicalPosition(await invokeTauri<PositionLike>("plugin:window|cursor_position"));
+}
+
 export interface Monitor {
   name: string | null;
   size: PhysicalSize;

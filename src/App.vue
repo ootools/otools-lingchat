@@ -16,6 +16,7 @@ import StoryPanel from './components/StoryPanel.vue';
 import ConnectionsPanel from './components/ConnectionsPanel.vue';
 import EmotionModelPanel from './components/EmotionModelPanel.vue';
 import AiModelSettings from './components/AiModelSettings.vue';
+import AgentControls from './components/AgentControls.vue';
 
 const c = useCompanion();
 const {
@@ -48,7 +49,7 @@ const canReadFiles = computed(() => (explicitPreview && !host.value) || !!(host.
 const canWriteFiles = computed(() => (explicitPreview && !host.value) || !!host.value?.writeHostFile);
 const canObserve = computed(() => !!(host.value?.observation?.targets && host.value.capture && host.value.ai));
 const availableAi = computed(() => !!host.value?.ai || explicitPreview);
-const canSend = computed(() => !loading.value && active.value && !!role.value && !busy.value && !acting.value && availableAi.value && !!draft.value.trim());
+const canSend = computed(() => !loading.value && active.value && !!role.value && !busy.value && !acting.value && (c.agentMode.value && !externalContext.value ? c.agentReady.value : availableAi.value) && !!draft.value.trim());
 const canEdit = computed(() => !loading.value && active.value && !!role.value && !acting.value && !busy.value);
 const avatarVisible = computed(() => !!avatar.value && !avatarBroken.value);
 const panelTitle = computed(() => t(navigation.find(item => item === tab.value) ?? 'chat'));
@@ -223,6 +224,7 @@ onBeforeUnmount(() => {
         <button v-else type="submit" class="send-button" :disabled="!canSend" :aria-label="t('send')" :title="t('send')"><Icon name="send" :size="18" /></button>
         <button type="button" class="icon-button composer-collapse" :aria-label="t('close')" :title="t('close')" @click="composerOpen = false"><Icon name="down" :size="16" /></button>
       </form>
+      <AgentControls v-if="c.agentMode.value && (composerOpen || c.agentActivity.value.permission || c.agentActivity.value.question)" class="compact-agent-status" :companion="c" compact />
       <p v-if="explicitPreview" class="compact-notice">{{ t('preview') }}</p>
       <p v-else-if="!host?.ai" class="compact-notice">{{ t('noHost') }}</p>
     </section>
@@ -255,6 +257,7 @@ onBeforeUnmount(() => {
           <div v-else-if="!role" class="empty-state"><Icon name="saves" :size="36" /><p>{{ t('empty') }}</p><button class="button primary" @click="c.attempt(c.initialize)">{{ t('retry') }}</button></div>
 
           <section v-else-if="tab === 'chat'" class="chat-view">
+            <AgentControls :companion="c" :disabled="busy || acting || loading" />
             <div ref="chatScroll" class="chat-scroll">
               <div class="chat-welcome"><div><span class="eyebrow"><Icon name="sun" :size="15" />{{ t('companion') }}</span><h1>{{ t('greeting') }}</h1><p>{{ t('greetingSub') }}</p><div class="welcome-detail"><span><Icon name="heart" :size="14" />{{ t('bond') }} <strong>{{ role.bond }}</strong></span><span>{{ messages.length }} {{ t('messages') }}</span></div></div><button class="welcome-avatar" :disabled="acting" :aria-label="t('pet')" @click="run(c.pet)"><img v-if="avatarVisible" :src="avatar" :alt="characterName" @error="avatarBroken = true" /><Mascot v-else :emotion="emotion" /></button></div>
               <div class="conversation-divider"><span>{{ currentSave?.name }}</span></div>

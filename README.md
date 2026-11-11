@@ -63,3 +63,7 @@ See [UPSTREAM.md](UPSTREAM.md) for the exact revision, adaptation map and limita
 ## Corresponding source
 
 Source target: https://github.com/ootools/otools-lingchat . Release packages must link to the corresponding source revision and include this repository's build scripts, dependency lockfile, SDK source and host integration source/patches. Do not publish private saves, imported assets or credentials.
+
+## Optional host Agent mode
+
+Agent / tools mode is off by default. When explicitly enabled, LingChat uses the host-managed Codex or ACP service for foreground messages and only selected, currently authorized plugin tools. Codex uses this plugin's model and reasoning selection; ACP/native profiles retain their native configuration. Session/run links are separate from exported saves and permanent memory. Temporary notes and captures continue through ordinary AI for that turn. Closing, stopping or switching save/role cancels and closes owned foreground work. Requires an updated Otools host; real model inference and ACP task acceptance have not been performed.

@@ -12,6 +12,13 @@ export interface SaveRecord {
   schemaVersion: 1; id: string; name: string; createdAt: string; updatedAt: string;
   roles: Record<string, RoleState>;
 }
+/** Host linkage is deliberately outside SaveRecord, exports, chat and permanent memory. */
+export interface AgentLink {
+  saveId: string; roleId: string; generation: string; providerId: string;
+  workspaceId: string; sessionId: string; runId?: string;
+}
+const AGENT_PREFIX = 'agent-link:';
+const agentKey = (scope: Pick<AgentLink, 'saveId' | 'roleId' | 'generation'>) => AGENT_PREFIX + JSON.stringify([scope.saveId, scope.roleId, scope.generation]);
 export type RolePatch = Partial<Pick<RoleState, 'persona' | 'outfitId' | 'scriptState' | 'bond' | 'achievements'>>;
 const PREFIX = 'save:';
 const reserved = new Set(['__proto__', 'prototype', 'constructor']);
@@ -59,6 +66,13 @@ function newRole(saveId: string, roleId: string): RoleState {
 
 export class SaveRepository {
   constructor(readonly store: AsyncStore) {}
+  async listAgentLinks(): Promise<AgentLink[]> { return (await this.store.list<AgentLink>(AGENT_PREFIX)).map(row => row.value); }
+  async putAgentLink(link: AgentLink, guard: () => boolean): Promise<void> {
+    await this.store.update<AgentLink>(agentKey(link), previous => guard() ? cloneValue(link) : previous);
+  }
+  async removeAgentLink(link: AgentLink): Promise<void> {
+    await this.store.update<AgentLink>(agentKey(link), previous => previous?.sessionId === link.sessionId ? undefined : previous);
+  }
   async create(name: string, roleId: string, id: string = crypto.randomUUID()): Promise<SaveRecord> {
     identifier(id); identifier(roleId);
     const now = new Date().toISOString();
@@ -107,7 +121,7 @@ export class SaveRepository {
   }
   async remove(saveId: string): Promise<void> { identifier(saveId); await this.store.update(PREFIX + saveId, () => undefined); }
   async clearChat(saveId: string, roleId: string): Promise<RoleState | undefined> {
-    return this.mutate(saveId, roleId, undefined, role => { role.messages = []; role.memory = emptyMemory(); });
+    return this.mutate(saveId, roleId, undefined, role => { role.generation = crypto.randomUUID(); role.messages = []; role.memory = emptyMemory(); });
   }
   async exportSave(saveId: string): Promise<string> {
     const save = await this.store.get<SaveRecord>(PREFIX + saveId);

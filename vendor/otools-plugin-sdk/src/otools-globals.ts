@@ -114,6 +114,7 @@ export interface OToolsEnv {
 export interface OToolsAPI {
   capture?: import('./capture-factory').CaptureApi;
   ai?: import('./ai-types').AiApi;
+  agent?: import('./agent-factory').AgentApi;
   data?: ReturnType<typeof import('./plugin-data-factory').createPluginDataApi>;
   observation?: import('./observation-factory').ObservationApi;
   reminders?: ReturnType<typeof import('./reminder-factory').createReminderApi>;

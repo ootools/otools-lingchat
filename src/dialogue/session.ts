@@ -7,7 +7,7 @@ export interface AiMessage {
 }
 export interface AiEvent { sequence: number; type: 'delta' | 'done' | 'error' | 'cancelled'; text?: string; error?: string }
 export interface HostAi {
-  consume(request: { messages: AiMessage[]; temperature?: number; maxTokens?: number }, options: {
+  consume(request: { messages: AiMessage[]; temperature?: number; maxTokens?: number; model?: string; reasoningEffort?: string }, options: {
     signal?: AbortSignal; onEvent?: (event: AiEvent) => void; pollIntervalMs?: number;
   }): Promise<{ id: string; text: string }>;
 }
@@ -46,7 +46,7 @@ export class ChatSession {
   abort(): void { this.epoch++; this.controller?.abort(); this.controller = undefined; }
   dispose(): void { this.abort(); this.selected = undefined; this.disposed = true; }
   private emit(update: SessionUpdate): void { this.options.onUpdate?.(update); }
-  async send(text: string, options: SendOptions = {}): Promise<string> {
+  async send(text: string, options: SendOptions = {}, foreground?: HostAi): Promise<string> {
     if (this.disposed || !this.selected) throw new Error('Select a save and role first');
     if (this.controller) throw new Error('A response is already streaming');
     if (!text.trim() || Array.from(text).length > 12_000) throw new Error('Message must contain 1–12000 characters');
@@ -97,7 +97,8 @@ export class ChatSession {
         requireCurrent(); if (!saved) throw abortError(); role = saved;
       }
       this.emit({ status: 'streaming', saveId, roleId, text: '' });
-      const response = await this.options.ai.consume({ messages }, {
+      // An explicit turn override cannot capture notes/screens, even when their storage was opted in.
+      const response = await (!external && foreground ? foreground : this.options.ai).consume({ messages }, {
         signal: controller.signal,
         onEvent: event => {
           if (!current() || event.sequence <= lastSequence) return;

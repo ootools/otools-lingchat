@@ -10,6 +10,17 @@ async function setup(ai: HostAi, onUpdate?: (value: SessionUpdate) => void) {
   return { repository, session };
 }
 describe('chat orchestration', () => {
+  it('scopes the explicit transport override to one ordinary send and keeps ephemeral sends on AI', async () => {
+    const normal: any[] = []; const agent: any[] = [];
+    const { session } = await setup({ consume: async request => { normal.push(request); return { id: 'ai', text: 'Normal' }; } });
+    const foreground: HostAi = { consume: async request => { agent.push(request); return { id: 'agent', text: 'Agent' }; } };
+    await session.send('Use tools', {}, foreground);
+    await session.send('Read this', { externalContext: 'PRIVATE' }, foreground);
+    await session.send('Look', { captureImageIds: ['capture'] }, foreground);
+    await session.send('Normal again');
+    expect(agent).toHaveLength(1); expect(normal).toHaveLength(3);
+    expect(JSON.stringify(agent)).not.toContain('PRIVATE');
+  });
   it('streams host deltas and persists completed turns with persona and memory context', async () => {
     const updates: SessionUpdate[] = []; let received: any;
     const { session, repository } = await setup({ consume: async (request, options) => {

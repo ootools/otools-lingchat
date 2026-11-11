@@ -50,6 +50,10 @@
       "types": "./dist/observation-factory.d.ts",
       "import": "./dist/observation-factory.js"
     },
+    "./agent-factory": {
+      "types": "./dist/agent-factory.d.ts",
+      "import": "./dist/agent-factory.js"
+    },
     "./capture": {
       "types": "./dist/capture.d.ts",
       "import": "./dist/capture.js",

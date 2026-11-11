@@ -1,6 +1,8 @@
 export * from './capture';
 export { createAiApi } from './ai-factory';
 export type * from './ai-types';
+export { createAgentApi } from './agent-factory';
+export type * from './agent-types';
 export { createPluginDataApi } from './plugin-data-factory';
 export type * from './plugin-data-types';
 export * from './observation-factory';

@@ -13,6 +13,7 @@ export default defineConfig({
         "capture-factory": "src/capture-factory.ts",
         "ai-factory": "src/ai-factory.ts",
         "plugin-data-factory": "src/plugin-data-factory.ts",
+        "agent-factory": "src/agent-factory.ts",
         "observation-factory": "src/observation-factory.ts",
         "reminder-factory": "src/reminder-factory.ts",
         "popup-manager": "src/popup-manager.ts",

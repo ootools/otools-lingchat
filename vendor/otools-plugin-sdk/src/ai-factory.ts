@@ -1,4 +1,4 @@
-import type { AiApi, AiCapabilities, AiEvent, AiReadResult, AiTransport } from './ai-types';
+import type { AiApi, AiCapabilities, AiMediaChannel, AiModelCatalog, AiReadResult, AiSelection, AiTransport } from './ai-types';
 export type * from './ai-types';
 
 export class AiError extends Error {
@@ -36,14 +36,66 @@ function validateBatch(value: AiReadResult, id: string, after: number): void {
   if (value.done !== terminal) invalid();
 }
 
+function normalizeSelection(value: AiSelection): AiSelection {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new AiError('invalidSettings');
+  const field = (input: unknown, maxLength: number): string | null => {
+    if (input === null) return null;
+    if (typeof input !== 'string' || input.length > maxLength || !input.trim()) throw new AiError('invalidSettings');
+    return input.trim();
+  };
+  // Only selection fields cross IPC. Allowed IDs and efforts are validated by the host.
+  return { model: field(value.model, 512), reasoningEffort: field(value.reasoningEffort, 64) };
+}
+
+function mediaRequest(value: unknown, fields: readonly string[]): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new AiError('invalidRequest');
+  const request = value as Record<string, unknown>;
+  return Object.fromEntries(fields.filter(field => request[field] !== undefined).map(field => [field, request[field]]));
+}
+
 /** Dependency-free factory for both the SDK runtime and the injected window API. */
 export function createAiApi(transport: AiTransport): AiApi {
   const call = async <T>(method: string, args?: Record<string, unknown>): Promise<T> => {
     try { return await transport.invoke(`otools_host_ai_${method}`, args) as T; }
     catch (error) { throw normalizeError(error); }
   };
+  const mediaCall = async <T>(command: string, request: unknown): Promise<T> => {
+    try { return await transport.invoke(command, { request }) as T; }
+    catch (error) { throw normalizeError(error); }
+  };
+  const mediaSaves = new Map<AiMediaChannel, Promise<{ model: string | null }>>();
+  const mediaExecute = async <T>(channel: AiMediaChannel, command: string, request: Record<string, unknown>): Promise<T> => {
+    for (;;) {
+      const saving = mediaSaves.get(channel); await saving;
+      const model = request.model ?? (await call<{ model: string | null }>('media_get_settings', { channel })).model;
+      if (saving !== mediaSaves.get(channel)) continue;
+      if (typeof model !== 'string' || !model.trim()) throw new AiError('modelNotSelected');
+      return mediaCall(command, { ...request, model });
+    }
+  };
   const api: AiApi = {
+    media: {
+      models: ({ channel }) => call('media_models', { channel }),
+      getSettings: ({ channel }) => call('media_get_settings', { channel }),
+      saveSettings: async ({ channel, model }) => {
+        const normalized = normalizeSelection({ model, reasoningEffort: null }).model;
+        const previous = mediaSaves.get(channel);
+        const saved = (async () => { await previous?.catch(() => {}); return call<{ model: string | null }>('media_save_settings', { channel, model: normalized }); })();
+        mediaSaves.set(channel, saved); void saved.catch(() => {});
+        return saved;
+      },
+      images: request => mediaExecute('images', 'otools_ai_images', mediaRequest(request, ['prompt', 'model', 'size', 'n'])),
+      speech: request => mediaExecute('tts', 'otools_ai_speech', mediaRequest(request, ['input', 'model', 'voice', 'responseFormat', 'speed'])),
+      transcribe: request => mediaExecute('stt', 'otools_ai_transcribe', mediaRequest(request, ['audioBase64', 'filename', 'model', 'language'])),
+      embeddings: request => mediaExecute('embeddings', 'otools_ai_embeddings', mediaRequest(request, ['input', 'model'])),
+      videoSubmit: request => mediaExecute('video', 'otools_ai_video_submit', mediaRequest(request, ['prompt', 'model', 'image', 'duration', 'fps', 'width', 'height', 'seed', 'metadata'])),
+      videoStatus: request => mediaCall('otools_ai_video_status', mediaRequest(request, ['taskId', 'refresh'])),
+      videoContent: request => mediaCall('otools_ai_video_content', mediaRequest(request, ['taskId'])),
+    },
     capabilities: () => call<AiCapabilities>('capabilities'),
+    models: () => call<AiModelCatalog>('models'),
+    getSettings: () => call<AiSelection>('get_settings'),
+    saveSettings: async settings => call<AiSelection>('save_settings', { settings: normalizeSelection(settings) }),
     start: request => call('start', { request }),
     read: options => call('read', options),
     cancel: options => call('cancel', options),
@@ -103,8 +155,10 @@ export function createAiApi(transport: AiTransport): AiApi {
             if (done) return;
             if (!capability?.configured) throw new AiError('notConfigured');
             if (!capability.streaming || !capability.cancellation) throw new AiError('unsupported');
+            // Capabilities describe the default model, not an explicit alternative.
             // Unknown vision metadata must not be interpreted as unsupported.
-            if (capability.vision === 'unsupported' && request.messages.some(message => message.content.some(part => part.type === 'image'))) {
+            const usesDefaultModel = !request.model || request.model === capability.model;
+            if (usesDefaultModel && capability.vision === 'unsupported' && request.messages.some(message => message.content.some(part => part.type === 'image'))) {
               throw new AiError('visionUnsupported');
             }
             const started = await api.start(request);

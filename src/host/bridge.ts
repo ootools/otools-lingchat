@@ -2,9 +2,10 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { open, save, confirm } from '@tauri-apps/plugin-dialog';
 import type { HostAi } from '../dialogue/session';
 import type { ObservationApi } from './observation';
+import type { AiApi } from 'otools-plugin-sdk/ai-factory';
 
 export interface CompanionHost {
-  ai?: HostAi & { capabilities?(): Promise<unknown> };
+  ai?: HostAi & Partial<Pick<AiApi, 'capabilities' | 'models' | 'getSettings' | 'saveSettings'>>;
   observation?: ObservationApi;
   capture?: { release(id: string): Promise<void>; capabilities?(): Promise<unknown> };
   data?: Record<string, (...args: any[]) => Promise<any>>;

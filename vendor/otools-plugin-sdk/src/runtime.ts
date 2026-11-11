@@ -78,6 +78,18 @@ const isHostPluginStateCommand = (command: string) =>
 // answers "Unknown method" there, which the fallback does catch.
 const HOST_OWNED_COMMAND_PREFIX = "otools_host_";
 const HOST_OWNED_COMMANDS = new Set([
+  'otools_ai_switch_status',
+  'otools_ai_switch_models',
+  'otools_ai_embeddings',
+  'otools_ai_speech',
+  'otools_ai_transcribe',
+  'otools_ai_images',
+  'otools_ai_video_submit',
+  'otools_ai_video_status',
+  'otools_ai_video_content',
+  'otools_ai_generate_text',
+  'otools_ai_load_chat_history',
+  'otools_ai_save_chat_history',
   'detach_tools_tab_to_window',
   'open_custom_plugin_window',
   'list_custom_plugin_windows',

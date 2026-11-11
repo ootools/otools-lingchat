@@ -38,7 +38,9 @@ Build `dist-pack/otools-lingchat-0.1.0.oplg`, then use Otools local plugin insta
 
 The companion requires the host changes and SDK service types listed in `integration/`. Build/update the host before trying AI/data/observation. The companion has no AI API-key settings: configure the model in Otools, then check the connection from the plugin.
 
-For Notes, first open the updated Notes plugin to migrate its existing origin-local records. Backups remain untouched. Grant reading/subscription in the **host-owned consent window**; revocation is available in Otools Settings → Data sharing. Enable background reminders separately.
+For Notes, first open the updated Notes plugin to migrate its existing origin-local records. Backups remain untouched. In **Plugin connections**, choose the currently listed providers and data types, then click **Connect selected data**. One host-owned consent window covers that explicit selection. Waiting for consent is not a connection: data appears only after approval and a successful authorized read. Denial, closing the consent window, or expiry ends the wait; a newly installed provider is never included automatically. Disconnect in the companion or revoke in Otools Settings → Data sharing. Enable background reminders separately.
+
+MCP tool access is independent of data sharing. Enabled MCP plugins default to Recommended, including ordinary writes; only tools explicitly listed as sensitive are excluded. Existing Off or Custom choices are preserved. Tool recommendation does not automatically authorize plugin-data records, MCP resources, prompts or screen observation.
 
 ## Privacy
 

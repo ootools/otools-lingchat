@@ -1,6 +1,8 @@
 import { ref, computed } from 'vue';
+import { connectionLabels } from '../host/connectionLabels';
 export const languages = [{ id: 'zh', name: '简体中文' }, { id: 'en', name: 'English' }, { id: 'ja', name: '日本語' }, { id: 'ko', name: '한국어' }, { id: 'de', name: 'Deutsch' }, { id: 'es', name: 'Español' }, { id: 'ru', name: 'Русский' }, { id: 'ar', name: 'العربية' }];
 const zh = {
+  ...connectionLabels.zh,
   app: '灵伴', tagline: '在你身边，陪你日常', chat: '对话', saves: '存档', characters: '角色', story: '故事', memory: '记忆', notes: '便笺', settings: '设置',
   companion: '你的桌面伙伴', online: '陪伴中', greeting: '今天，也想陪你一起。', greetingSub: '分享一件小事，或是安静待一会儿。', petName: '小糯', petSubtitle: '把日子过得软乎乎的',
   welcome: '你好呀，我是小糯。今天有什么想和我说的吗？', input: '说点什么吧，我在听…', send: '发送', stop: '停止', thinking: '认真听你说…', you: '你', today: '今天',
@@ -33,6 +35,7 @@ const translations: Record<string, Partial<Record<TextKey, string>>> = {
 export function useLocale() {
   const locale = ref('zh');
   const setLocale = (value: string) => { const code = value.split(/[-_]/)[0]; locale.value = languages.some(l => l.id === code) ? code : 'zh'; };
-  const t = (key: TextKey) => translations[locale.value]?.[key] ?? (locale.value === 'zh' ? zh[key] : translations.en[key]) ?? zh[key];
+  const connections: Record<string, Partial<Record<TextKey, string>>> = connectionLabels;
+  const t = (key: TextKey) => connections[locale.value]?.[key] ?? translations[locale.value]?.[key] ?? (locale.value === 'zh' ? zh[key] : translations.en[key]) ?? zh[key];
   return { locale, setLocale, t, direction: computed(() => locale.value === 'ar' ? 'rtl' : 'ltr') };
 }

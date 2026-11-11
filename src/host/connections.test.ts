@@ -36,6 +36,29 @@ describe('connections discovery and grants', () => {
     });
     expect(await controller.connect(notes, 'notes.v1')).toBe('granted');
   });
+  it('requests an explicit group with one host consent and tracks its terminal state', async () => {
+    const calls: unknown[] = [];
+    const controller = createConnectionsController({
+      data: {
+        discover: async () => [], list: async () => ({}), requestAccess: async () => ({ status: 'pending' }), revokeAccess: async () => undefined,
+        requestAccessBatch: async request => { calls.push(request); return { id: 'bundle-1', status: 'pending', expiresAt: 5000 }; },
+        accessStatus: async request => { calls.push(request); return { id: 'bundle-1', status: 'denied', expiresAt: 5000 }; },
+      },
+    });
+    const items = [{ provider: notes, type: 'notes.v1' }, { provider: devNotes, type: 'notes.v1' }];
+    expect(await controller.connectBatch(items)).toEqual({ id: 'bundle-1', status: 'pending', expiresAt: 5000 });
+    expect(await controller.accessStatus('bundle-1')).toMatchObject({ status: 'denied' });
+    expect(calls).toEqual([
+      { items: items.map(item => ({ ...item, scope: { kind: 'all' }, subscribe: true })) },
+      { id: 'bundle-1' },
+    ]);
+  });
+  it('rejects malformed consent responses instead of treating them as pending forever', async () => {
+    const controller = createConnectionsController({
+      data: { discover: async () => [], list: async () => ({}), requestAccess: async () => ({ status: 'nonsense' }), revokeAccess: async () => undefined },
+    });
+    await expect(controller.connect(notes, 'notes.v1')).rejects.toThrow();
+  });
   it('keeps discovery usable when the name lookup is unavailable in old hosts', async () => {
     const controller = createConnectionsController({
       data: { discover: async () => [{ provider: notes, types: ['notes.v1'] }], list: async () => ({}), requestAccess: async () => ({ status: 'pending' }), revokeAccess: async () => undefined },

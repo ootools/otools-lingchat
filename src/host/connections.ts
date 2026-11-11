@@ -2,10 +2,14 @@ import { invoke } from '@tauri-apps/api/core';
 import type { ProviderIdentity } from './providers';
 
 export interface DiscoveredProvider { provider: ProviderIdentity; types: string[] }
+export interface ConsentStatus { id?: string; status: string; expiresAt?: number }
+export interface ConnectionItem { provider: ProviderIdentity; type: string }
 export interface ConnectionsDataApi {
   discover(): Promise<DiscoveredProvider[]>;
   list(request: { provider: ProviderIdentity; type: string; limit?: number; cursor?: string }): Promise<unknown>;
-  requestAccess(request: { provider: ProviderIdentity; type: string; subscribe?: boolean; scope?: { kind: 'all' } }): Promise<{ status: string }>;
+  requestAccess(request: { provider: ProviderIdentity; type: string; subscribe?: boolean; scope?: { kind: 'all' } }): Promise<ConsentStatus>;
+  requestAccessBatch?(request: { items: Array<ConnectionItem & { subscribe: boolean; scope: { kind: 'all' } }> }): Promise<ConsentStatus>;
+  accessStatus?(request: { id: string }): Promise<ConsentStatus>;
   revokeAccess(request: { provider: ProviderIdentity; type: string }): Promise<unknown>;
 }
 export type GrantState = 'connected' | 'unauthorized';
@@ -35,6 +39,13 @@ export async function listPluginNames(): Promise<Record<string, string>> {
   return names;
 }
 
+function validateConsent(value: ConsentStatus): ConsentStatus {
+  if (!value || !['granted', 'pending', 'denied', 'cancelled', 'expired'].includes(value.status)) {
+    throw new Error('Host returned an invalid data consent status');
+  }
+  return value;
+}
+
 export function createConnectionsController(deps: { data: ConnectionsDataApi; pluginNames?: () => Promise<Record<string, string>> }) {
   const names = deps.pluginNames ?? listPluginNames;
   return {
@@ -50,8 +61,22 @@ export function createConnectionsController(deps: { data: ConnectionsDataApi; pl
     },
     probeGrantState: (provider: ProviderIdentity, type: string) => probeGrantState(deps.data, provider, type),
     async connect(provider: ProviderIdentity, type: string): Promise<ConnectResult> {
-      const result = await deps.data.requestAccess({ provider, type, subscribe: true, scope: { kind: 'all' } });
-      return result?.status === 'granted' ? 'granted' : 'pending';
+      const result = validateConsent(await deps.data.requestAccess({ provider, type, subscribe: true, scope: { kind: 'all' } }));
+      if (result.status !== 'granted' && result.status !== 'pending') throw new Error('Data consent was not granted');
+      return result.status;
+    },
+    async connectBatch(items: ConnectionItem[]): Promise<ConsentStatus> {
+      if (!items.length || items.length > 32) throw new Error('Select between one and 32 data connections');
+      if (deps.data.requestAccessBatch) {
+        return validateConsent(await deps.data.requestAccessBatch({ items: items.map(item => ({ ...item, scope: { kind: 'all' }, subscribe: true })) }));
+      }
+      if (items.length !== 1) throw new Error('Update Otools to approve multiple data connections together');
+      const item = items[0];
+      return validateConsent(await deps.data.requestAccess({ ...item, scope: { kind: 'all' }, subscribe: true }));
+    },
+    async accessStatus(id: string): Promise<ConsentStatus> {
+      if (!deps.data.accessStatus) throw new Error('Update Otools to track data approval');
+      return validateConsent(await deps.data.accessStatus({ id }));
     },
     async disconnect(provider: ProviderIdentity, type: string): Promise<GrantState> {
       await deps.data.revokeAccess({ provider, type });

@@ -40,7 +40,8 @@ export interface PluginDataChangesPage<T = unknown> {
   hasMore: boolean;
 }
 export interface PluginDataAccessRequest { provider: PluginDataIdentity; type: string; scope?: PluginDataScope; subscribe?: boolean }
-export interface PluginDataAccessStatus { id: string; status: 'pending' }
+export interface PluginDataAccessBatch { items: PluginDataAccessRequest[] }
+export interface PluginDataAccessStatus { id: string; status: 'pending' | 'granted' | 'denied' | 'cancelled' | 'expired'; expiresAt?: number }
 export interface PluginDataRevokeRequest { provider: PluginDataIdentity; type: string }
 export type PluginDataErrorCode = 'permissionDenied' | 'forbidden' | 'conflict' | 'deleted' | 'resyncRequired' | 'invalidCursor' | 'invalidRequest' | 'storageFailed' | 'unavailable' | 'unsupported' | 'busy';
 export interface PluginDataFailure { code: PluginDataErrorCode; message: string }
@@ -58,8 +59,12 @@ export interface PluginDataApi {
   put<T = unknown, P = unknown>(request: PluginDataPutRequest<T, P>): Promise<PluginDataResource<T, P>>;
   remove(request: PluginDataRemoveRequest): Promise<PluginDataResource<null, never>>;
   changes<T = unknown>(request: PluginDataChangesRequest): Promise<PluginDataChangesPage<T>>;
-  /** Always opens host consent; a pending request is never an access grant. */
+  /** Requests host consent unless this exact grant already exists; pending is never a grant. */
   requestAccess(request: PluginDataAccessRequest): Promise<PluginDataAccessStatus>;
+  /** One host consent for the explicitly listed providers/types, never future plugins. */
+  requestAccessBatch(request: PluginDataAccessBatch): Promise<PluginDataAccessStatus>;
+  /** Read only the requesting consumer's pending/terminal consent state. */
+  accessStatus(request: { id: string }): Promise<PluginDataAccessStatus>;
   /** Withdraw only the authenticated consumer's grant. Does not grant access. */
   revokeAccess(request: PluginDataRevokeRequest): Promise<void>;
   /** Owner-bound polling; no global events. Returns idempotent cleanup. */

@@ -5,7 +5,7 @@ import type { ProviderIdentity } from '../host/providers';
 import type { TextKey } from '../composables/i18n';
 import Icon from './Icon.vue';
 const props = defineProps<{ provider: ProviderIdentity; type: string; t: (key: TextKey) => string }>();
-const emit = defineEmits<{ context: [text: string]; error: [error: unknown]; bubble: [text: string] }>();
+const emit = defineEmits<{ context: [text: string]; error: [error: unknown]; bubble: [text: string]; disconnected: [] }>();
 interface Note { provider: ProviderIdentity; type: string; id: string; revision: number; updatedAt: number; deleted: boolean; data: { title?: string; body?: string; todos?: Array<{ id: string; text: string; done: boolean }> } }
 const notes = shallowRef<Note[]>([]); const busy = ref(false);
 const background = ref(false); const quietStart = ref('22:00'); const quietEnd = ref('08:00'); const cooldown = ref(60);
@@ -17,17 +17,20 @@ async function load() {
   do {
     const page = await api().list({ provider: props.provider, type: props.type, cursor: next, limit: 100 });
     if (current !== epoch) return;
-    fresh.push(...(page.items as Note[]).filter(item => !item.deleted)); next = page.next ?? undefined;
+    fresh.push(...(page.items as Note[]).filter(item => !item.deleted));
+    next = page.next ?? undefined;
+    cursor = page.after;
   } while (next);
   notes.value = fresh;
   if (getHost()?.reminders) {
     const status = await getHost()!.reminders!.status();
+    if (current !== epoch) return;
     const watches = Array.isArray(status) ? status : status.watches ?? [];
     background.value = watches.some((watch: { provider?: ProviderIdentity; type?: string; enabled?: boolean }) => watch.provider?.source === props.provider.source && watch.provider?.uuid === props.provider.uuid && watch.type === props.type && watch.enabled);
   }
 }
 async function tick() {
-  if (checking) return;
+  if (checking || busy.value || !cursor) return;
   checking = true;
   try {
     const current = epoch;
@@ -44,9 +47,16 @@ async function tick() {
         await getHost()!.reminders!.acknowledge(items.map((item: { id: string }) => item.id));
       }
     }
-  } catch {
-    // A revoked grant immediately removes already rendered external material.
+  } catch (error) {
     notes.value = [];
+    const code = (error as { code?: string })?.code;
+    if (code === 'permissionDenied' || code === 'forbidden') {
+      clearInterval(poll); cursor = ''; background.value = false;
+      emit('disconnected');
+    } else if (code === 'resyncRequired') {
+      try { await load(); }
+      catch (error) { emit('error', error); }
+    } else emit('error', error);
   } finally { checking = false; }
 }
 async function useNote(note: Note) {

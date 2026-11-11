@@ -1,5 +1,5 @@
 import type {
-  PluginDataApi, PluginDataChangesPage, PluginDataErrorCode, PluginDataFailure, PluginDataTransport,
+  PluginDataAccessRequest, PluginDataApi, PluginDataChangesPage, PluginDataErrorCode, PluginDataFailure, PluginDataTransport,
 } from './plugin-data-types';
 export type * from './plugin-data-types';
 
@@ -23,6 +23,34 @@ function normalizeError(error: unknown): PluginDataError {
 function revision(value: number): void {
   if (!Number.isSafeInteger(value) || value < 0) throw new PluginDataError('invalidRequest', 'expectedRevision must be a non-negative safe integer');
 }
+function validName(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && new TextEncoder().encode(value).length <= 256
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+function accessItems(items: PluginDataAccessRequest[]): PluginDataAccessRequest[] {
+  const seen = new Set<string>();
+  return items.map(item => {
+    if (!item || !item.provider || !validName(item.provider.source) || !validName(item.provider.uuid)
+      || [item.provider.source, item.provider.uuid].some(value => value.trim() !== value || /[A-Z]/.test(value))
+      || !validName(item.type) || (item.subscribe !== undefined && typeof item.subscribe !== 'boolean')) {
+      throw new PluginDataError('invalidRequest', 'Access items require a canonical provider, resource type and optional boolean subscribe');
+    }
+    if (item.scope !== undefined && (!item.scope || (item.scope.kind !== 'all' && item.scope.kind !== 'ids')
+      || (item.scope.kind === 'ids' && (!Array.isArray(item.scope.ids) || !item.scope.ids.length
+        || item.scope.ids.length > 256 || ![...item.scope.ids].every(validName))))) {
+      throw new PluginDataError('invalidRequest', 'Access scope must be all or contain 1..256 valid IDs');
+    }
+    const key = JSON.stringify([item.provider.source, item.provider.uuid, item.type]);
+    if (seen.has(key)) throw new PluginDataError('invalidRequest', 'Duplicate access item');
+    seen.add(key);
+    return {
+      provider: { source: item.provider.source, uuid: item.provider.uuid },
+      type: item.type,
+      ...(item.scope ? { scope: item.scope.kind === 'ids' ? { kind: 'ids' as const, ids: [...item.scope.ids] } : { kind: 'all' as const } } : {}),
+      ...(item.subscribe !== undefined ? { subscribe: item.subscribe } : {}),
+    };
+  });
+}
 
 /** Dependency-free client suitable for native SDK imports and host runtime injection. */
 export function createPluginDataApi(transport: PluginDataTransport): PluginDataApi {
@@ -37,6 +65,13 @@ export function createPluginDataApi(transport: PluginDataTransport): PluginDataA
     async put(request) { revision(request.expectedRevision); return call('put', request); },
     async remove(request) { revision(request.expectedRevision); return call('remove', request); },
     changes: request => call('changes', request),
+    async requestAccessBatch(request) {
+      if (!request || !Array.isArray(request.items) || !request.items.length || request.items.length > 32) {
+        throw new PluginDataError('invalidRequest', 'Access bundles contain 1..32 explicit items');
+      }
+      return call('request_access_batch', { items: accessItems(request.items) });
+    },
+    accessStatus: request => call('access_status', { id: request.id }),
     requestAccess: request => call('request_access', request),
     revokeAccess: request => call('revoke_access', request),
     subscribe(request, onChanges, options) {

@@ -15,7 +15,7 @@
   "openMode": "custom",
   "pluginData": { "provides": [], "consumes": ["notes.v1"] },
   "customWindow": {
-    "width": 380, "height": 520,
+    "width": 215, "height": 228,
     "transparent": true, "decorations": false, "shadow": false,
     "resizable": true, "alwaysOnTop": true, "skipTaskbar": true
   }

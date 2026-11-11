@@ -112,6 +112,19 @@ export async function cursorPosition(): Promise<PhysicalPosition> {
   return new PhysicalPosition(await invokeTauri<PositionLike>("plugin:window|cursor_position"));
 }
 
+export async function primaryMonitor(): Promise<Monitor | null> {
+  if (!hasTauriWindowApi()) return null;
+  const monitor = await invokeTauri<{
+    name: string | null; size: SizeLike; position: PositionLike;
+    workArea?: { position: PositionLike; size: SizeLike }; scaleFactor: number;
+  } | null>("plugin:window|primary_monitor");
+  return monitor ? {
+    ...monitor,
+    size: new PhysicalSize(monitor.size), position: new PhysicalPosition(monitor.position),
+    workArea: { size: new PhysicalSize(monitor.workArea?.size ?? monitor.size), position: new PhysicalPosition(monitor.workArea?.position ?? monitor.position) },
+  } : null;
+}
+
 export interface Monitor {
   name: string | null;
   size: PhysicalSize;

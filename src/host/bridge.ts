@@ -1,4 +1,5 @@
-import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
+import { getCurrentWindow, LogicalSize, PhysicalPosition } from '@tauri-apps/api/window';
+import { compactLayout, PET_ARTWORK, PANEL_LAYOUT, WindowGeometry, type PetLayout } from './petGeometry';
 import { open, save, confirm } from '@tauri-apps/plugin-dialog';
 import type { HostAi } from '../dialogue/session';
 import type { ObservationApi } from './observation';
@@ -76,9 +77,14 @@ export async function exportFile(name: string, text: string): Promise<boolean> {
 export async function confirmAction(message: string): Promise<boolean> {
   return preview && !getHost() ? window.confirm(message) : confirm(message, { kind: 'warning' });
 }
+const geometry = new WindowGeometry({
+  read:async()=>{const native=getCurrentWindow();const[origin,size,scale]=await Promise.all([native.outerPosition(),native.innerSize(),native.scaleFactor()]);return{origin,size,scale};},
+  setSize:size=>getCurrentWindow().setSize(new LogicalSize(size.width,size.height)),
+  setPosition:position=>getCurrentWindow().setPosition(new PhysicalPosition(position.x,position.y)),
+});
 export const nativeWindow = {
   async drag() { if (!preview) await getCurrentWindow().startDragging(); },
   async topmost(value: boolean) { if (!preview) await getCurrentWindow().setAlwaysOnTop(value); },
-  async resize(expanded: boolean) { if (!preview) await getCurrentWindow().setSize(new LogicalSize(expanded ? 1100 : 360, expanded ? 760 : 520)); },
+  async resize(expanded: boolean, layout?:PetLayout, isCurrent?:()=>boolean) { if (!preview) await geometry.apply(layout??(expanded?PANEL_LAYOUT:compactLayout(PET_ARTWORK,1,false)),expanded,isCurrent); },
   async close() { if (!preview) await getCurrentWindow().close(); },
 };

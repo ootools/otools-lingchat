@@ -25,7 +25,7 @@ export function useCompanion(options: { store?: AsyncStore } = {}) {
   const memoryService = new MemoryService(repository, createHostSummarizer(hostAi));
   const audio = new AudioController();
   const error = ref(''); const toast = ref(''); const loading = ref(true); const busy = ref(false);
-  const expanded = ref(preview); const tab = ref('chat'); const draft = ref(''); const streamed = ref('');
+  const expanded = ref(false); const tab = ref('chat'); const draft = ref(''); const streamed = ref('');
   const saves = shallowRef<SaveRecord[]>([]); const saveId = ref(''); const roleId = ref('mochi');
   const role = shallowRef<RoleState>(); const characters = shallowRef<CharacterPack[]>([]);
   const bubble = ref(''); const emotion = ref('平静'); const externalContext = ref('');
@@ -197,7 +197,7 @@ export function useCompanion(options: { store?: AsyncStore } = {}) {
   async function exportMemory() { await exportFile('lingchat-memory.json', await memoryService.export(saveId.value, roleId.value)); }
   async function importMemory() { const file = await chooseFile(['json']); if (!file) return; await stop(); await memoryService.import(saveId.value, roleId.value, new TextDecoder().decode(file.bytes)); await refresh(); notify(t('imported')); }
   async function clearChat() { if (!await confirmAction(t('confirmClear'))) return; await stop(); await repository.clearChat(saveId.value, roleId.value); await refresh(); }
-  async function toggleExpanded() { expanded.value = !expanded.value; await nativeWindow.resize(expanded.value); }
+  async function toggleExpanded() { expanded.value = !expanded.value; }
   async function refreshTargets() {
     const api = getHost()?.observation; if (!api?.targets) throw unavailable('观察目标列表');
     const result = await api.targets();

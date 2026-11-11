@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-const props = withDefaults(defineProps<{ emotion?: string; compact?: boolean }>(), { emotion: '平静' });
+const props = withDefaults(defineProps<{ emotion?: string; compact?: boolean; cropped?: boolean }>(), { emotion: '平静' });
 const mood = computed(() => /开心|happy|喜|爱/.test(props.emotion) ? 'happy' : /难过|sad|哭|伤/.test(props.emotion) ? 'sad' : /生气|angry|怒/.test(props.emotion) ? 'angry' : /惊|surprise/.test(props.emotion) ? 'surprise' : /困|sleep/.test(props.emotion) ? 'sleep' : 'calm');
 </script>
 <template>
   <!-- Original vector artwork created for Otools LingChat; no upstream artwork used. -->
-  <svg class="mascot" :class="[mood, { compact }]" viewBox="0 0 320 340" role="img" :aria-label="`小糯 · ${emotion}`">
+  <svg class="mascot" :class="[mood, { compact }]" :viewBox="cropped ? '35 28 270 287' : '0 0 320 340'" role="img" :aria-label="`小糯 · ${emotion}`">
     <defs>
       <linearGradient id="catCoat" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fffdf7"/><stop offset="1" stop-color="#eee7da"/></linearGradient>
       <linearGradient id="catScarf" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#8bbca0"/><stop offset="1" stop-color="#4f8d73"/></linearGradient>
@@ -13,9 +13,9 @@ const mood = computed(() => /开心|happy|喜|爱/.test(props.emotion) ? 'happy'
     </defs>
     <ellipse cx="159" cy="298" rx="100" ry="15" fill="#385a44" opacity=".09"/>
     <circle cx="156" cy="168" r="145" fill="url(#catGlow)"/>
-    <g class="cat-tail"><path d="M226 256C292 277 294 221 265 218c-15-1-23 12-17 24" fill="none" stroke="#ddd5c8" stroke-width="29" stroke-linecap="round"/><path d="M228 250c58 25 62-25 36-25" fill="none" stroke="#f6f0e5" stroke-width="21" stroke-linecap="round"/></g>
+    <g class="cat-tail"><path data-pet-shape d="M226 256C292 277 294 221 265 218c-15-1-23 12-17 24" fill="none" stroke="#ddd5c8" stroke-width="29" stroke-linecap="round"/><path d="M228 250c58 25 62-25 36-25" fill="none" stroke="#f6f0e5" stroke-width="21" stroke-linecap="round"/></g>
     <g class="cat-body">
-      <path d="M112 195c-13 15-25 48-20 75 4 24 30 23 66 23s68 4 71-22c3-27-15-59-28-76Z" fill="url(#catCoat)" stroke="#dfd6c7" stroke-width="2"/>
+      <path data-pet-shape d="M112 195c-13 15-25 48-20 75 4 24 30 23 66 23s68 4 71-22c3-27-15-59-28-76Z" fill="url(#catCoat)" stroke="#dfd6c7" stroke-width="2"/>
       <ellipse cx="158" cy="254" rx="39" ry="31" fill="#fffef8"/>
       <path d="M111 251c-11 0-21 28-4 36 11 4 21 0 22-7m57-29c11 0 25 28 8 36-11 4-21 0-22-7" fill="#faf6ed" stroke="#dfd6c7" stroke-width="2"/>
       <path d="m139 204 1 48 20-9-3-39" fill="url(#catScarf)"/>
@@ -24,7 +24,7 @@ const mood = computed(() => /开心|happy|喜|爱/.test(props.emotion) ? 'happy'
       <circle cx="161" cy="224" r="8" fill="#e5bf72" stroke="#ceaa61" stroke-width="1.5"/><path d="M161 222v5m-3-6h6" stroke="#a08047" stroke-width="1.5" stroke-linecap="round"/>
     </g>
     <g class="cat-head">
-      <path d="M80 111Q65 50 83 39q8-2 51 39h53q39-37 51-35 17 14 1 73c28 33 23 71-6 87-34 20-115 20-149-2-29-19-31-57-4-90Z" fill="url(#catCoat)" stroke="#dfd6c7" stroke-width="2.5"/>
+      <path data-pet-shape d="M80 111Q65 50 83 39q8-2 51 39h53q39-37 51-35 17 14 1 73c28 33 23 71-6 87-34 20-115 20-149-2-29-19-31-57-4-90Z" fill="url(#catCoat)" stroke="#dfd6c7" stroke-width="2.5"/>
       <path d="M85 92q-7-34 1-39 6 0 32 27Z" fill="#eac4ba"/><path d="M205 81q21-24 29-25 5 10-3 39Z" fill="#eac4ba"/>
       <path d="M143 82q9 10 5 20m12-22q8 10 4 20m11-17q7 8 2 16" fill="none" stroke="#d2c8b9" stroke-width="6" stroke-linecap="round" opacity=".7"/>
       <ellipse cx="103" cy="165" rx="15" ry="8" fill="#e7b5a9" opacity=".55"/><ellipse cx="215" cy="165" rx="15" ry="8" fill="#e7b5a9" opacity=".55"/>

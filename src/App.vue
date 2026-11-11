@@ -2,7 +2,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { getCurrentWindow, cursorPosition } from '@tauri-apps/api/window';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { compactLayout, PET_ARTWORK, PANEL_LAYOUT, type PetLayout } from './host/petGeometry';
+import type { PetCommand } from './host/petMenu';
+import DesktopPet from './components/DesktopPet.vue';
 import { useCompanion } from './composables/useCompanion';
 import { languages } from './composables/i18n';
 import { getHost, isExplicitPreview, nativeWindow } from './host/bridge';
@@ -29,7 +32,8 @@ const {
 const explicitPreview = isExplicitPreview(window.location.search);
 const navigation = ['chat', 'saves', 'characters', 'story', 'memory', 'connections', 'settings'] as const;
 const memorySections = Object.keys(MEMORY_LIMITS) as MemorySection[];
-const composerOpen = ref(false);
+const petLayout = ref<PetLayout>(compactLayout(PET_ARTWORK, 1, false));
+const noticeVersion = ref(0);
 const acting = ref(false);
 const newSaveOpen = ref(false);
 const newSaveName = ref('');
@@ -38,7 +42,7 @@ const outfitDraft = ref('default');
 const avatarBroken = ref(false);
 const aiStatus = ref('');
 const pendingUser = ref('');
-const composer = ref<HTMLTextAreaElement | null>(null);
+const composer = ref<HTMLInputElement | HTMLTextAreaElement | null>(null);
 const chatScroll = ref<HTMLElement | null>(null);
 let turn = 0;
 let disposed = false;
@@ -55,6 +59,16 @@ const avatarVisible = computed(() => !!avatar.value && !avatarBroken.value);
 const panelTitle = computed(() => t(navigation.find(item => item === tab.value) ?? 'chat'));
 const subtitle = computed(() => currentCharacter.value?.settings.ai_subtitle || t('petSubtitle'));
 const petStyle = computed(() => ({ '--pet-scale': String(Math.min(1.3, Math.max(0.7, scale.value))) }));
+async function syncWindow() {
+  if (disposed || !active.value || !hasNative.value) return;
+  const isCurrent=()=>!disposed&&active.value&&hasNative.value;
+  try {
+    if (expanded.value) await getCurrentWindow().setIgnoreCursorEvents(false);
+    if(!isCurrent())return;
+    await nativeWindow.resize(expanded.value, expanded.value ? PANEL_LAYOUT : petLayout.value,isCurrent);
+  } catch (value) { if(isCurrent())c.fail(value); }
+}
+watch([expanded, petLayout, active, hasNative], () => { void syncWindow(); });
 const observationRunning = computed(() => observationStatus.value?.state === 'active' || observationStatus.value?.state === 'pending');
 
 watch(avatar, () => { avatarBroken.value = false; });
@@ -90,10 +104,14 @@ function onComposerKeydown(event: KeyboardEvent) {
   }
 }
 async function togglePanel() {
-  if (!explicitPreview && !host.value) { expanded.value = !expanded.value; return; }
   await run(c.toggleExpanded);
-  if (!expanded.value) startCursorManager();
-  else await setNativeInteractive(true);
+}
+async function openPanel(next: typeof navigation[number]) {
+  if (!expanded.value) await togglePanel();
+  selectTab(next);
+  await nextTick();
+  if (hasNative.value) await getCurrentWindow().setFocus().catch(c.fail);
+  if (next === 'chat') composer.value?.focus();
 }
 function selectTab(next: typeof navigation[number]) {
   tab.value = next;
@@ -122,112 +140,42 @@ function date(value: string) { return new Date(value).toLocaleDateString(locale.
 function time(value: string) { return new Date(value).toLocaleTimeString(locale.value, { hour: '2-digit', minute: '2-digit' }); }
 function messageCount(save: SaveRecord) { return Object.values(save.roles).reduce((count, item) => count + item.messages.length, 0); }
 async function checkAi() { await run(async () => { await c.checkAi(); aiStatus.value = toast.value; }); }
-/** The transparent window must not block other apps: it starts click-through and
- *  only becomes interactive while the cursor is over an actual hit zone. */
-const CURSOR_POLL_MS = 120;
-let hitPoll: ReturnType<typeof setInterval> | undefined;
-let nativeInteractive = true;
-let bounds: { x: number; y: number; scale: number; ready: boolean } = { x: 0, y: 0, scale: 1, ready: false };
-function hitZones(): Array<{ x: number; y: number; w: number; h: number }> {
-  const zones: Array<{ x: number; y: number; w: number; h: number }> = [];
-  for (const node of document.querySelectorAll('[data-pet-hit]')) {
-    const rect = node.getBoundingClientRect();
-    if (rect.width > 0 && rect.height > 0) {
-      zones.push({ x: rect.x - 8, y: rect.y - 8, w: rect.width + 16, h: rect.height + 16 });
-    }
+async function petCommand(command: PetCommand) {
+  if (navigation.includes(command as typeof navigation[number])) { await openPanel(command as typeof navigation[number]); return; }
+  switch (command) {
+    case 'model': await openPanel('settings'); await nextTick(); document.querySelector<HTMLElement>('[data-ai-model-settings]')?.scrollIntoView({ block:'center' }); break;
+    case 'agent': await openPanel('chat'); break;
+    case 'pet': await run(c.pet); break;
+    case 'notice': noticeVersion.value++; break;
+    case 'topmost': toggleTopmost(); break;
+    case 'stop': stopReply(); break;
+    case 'stopObservation': await run(c.stopObservation); break;
+    case 'close': await close(); break;
   }
-  return zones;
-}
-async function setNativeInteractive(next: boolean) {
-  if (nativeInteractive === next || !hasNative.value || explicitPreview) return;
-  nativeInteractive = next;
-  try { await getCurrentWindow().setIgnoreCursorEvents(!next); }
-  catch { nativeInteractive = !next; }
-}
-async function syncCursor() {
-  if (!hasNative.value || explicitPreview || expanded.value || !active.value) return;
-  const native = getCurrentWindow();
-  if (!bounds.ready) {
-    try {
-      const [origin, scale] = await Promise.all([native.outerPosition(), native.scaleFactor()]);
-      bounds = { x: origin.x, y: origin.y, scale: scale || 1, ready: true };
-    } catch { return; }
-  }
-  const zones = hitZones();
-  let hovering = false;
-  if (zones.length) {
-    try {
-      const cursor = await cursorPosition();
-      const x = (cursor.x - bounds.x) / bounds.scale;
-      const y = (cursor.y - bounds.y) / bounds.scale;
-      hovering = zones.some(zone => x >= zone.x && x <= zone.x + zone.w && y >= zone.y && y <= zone.y + zone.h);
-    } catch { return; }
-  }
-  await setNativeInteractive(hovering);
-}
-function startCursorManager() {
-  if (!hasNative.value || explicitPreview) return;
-  nativeInteractive = true;
-  void getCurrentWindow().setIgnoreCursorEvents(true).then(() => { nativeInteractive = false; }).catch(c.fail);
-  hitPoll = setInterval(() => { void syncCursor(); }, CURSOR_POLL_MS);
-  const invalidate = () => { bounds.ready = false; };
-  void getCurrentWindow().onMoved(invalidate).catch(c.fail);
-  void getCurrentWindow().onResized(invalidate).catch(c.fail);
-}
-function openComposer() {
-  composerOpen.value = true;
-  void nextTick(() => composer.value?.focus());
 }
 async function reopen() {
   if (disposed) return;
-  await c.attempt(async () => { await c.reopen(); await c.refresh(); startCursorManager(); });
+  await c.attempt(async () => { await c.reopen(); await c.refresh(); await syncWindow(); });
 }
 async function close() { turn++; pendingUser.value = ''; await c.attempt(c.close); }
 
 onMounted(() => {
-  void c.initialize();
+  void c.initialize().then(syncWindow);
   if (!explicitPreview && getHost()) {
     void listen('otools:custom-open', () => { void reopen(); }).then(stop => {
       if (disposed) stop(); else unlisten = stop;
     }).catch(c.fail);
-    startCursorManager();
   }
 });
 onBeforeUnmount(() => {
   disposed = true; turn++; unlisten?.();
-  if (hitPoll) { clearInterval(hitPoll); hitPoll = undefined; }
   void c.dispose().catch(c.fail);
 });
 </script>
 
 <template>
   <div class="app-shell" :class="{ expanded, 'reduced-motion': reduceMotion }" :style="petStyle" :dir="direction" :lang="locale">
-    <section v-if="active && !expanded" class="pet-window" :aria-label="t('companion')">
-      <header class="pet-header drag-handle" data-pet-hit :title="t('drag')" @pointerdown="dragWindow">
-        <span class="pet-brand"><Icon name="characters" :size="17" />{{ t('app') }}<span class="status-dot" :class="{ muted: !availableAi }" /></span>
-        <div class="window-actions">
-          <button class="icon-button" :class="{ selected: topmost && hasNative }" :disabled="!hasNative || loading || acting" :aria-label="t('topmost')" :aria-pressed="topmost && hasNative" :title="t('topmost')" @click="toggleTopmost"><Icon name="pin" :size="16" /></button>
-          <button class="icon-button" :disabled="loading || acting" :aria-label="t('expand')" :title="t('expand')" @click="togglePanel"><Icon name="expand" :size="17" /></button>
-          <button class="icon-button close-button" :disabled="loading || (!hasNative && !explicitPreview)" :aria-label="t('close')" :title="t('close')" @click="close"><Icon name="close" :size="17" /></button>
-        </div>
-      </header>
-      <div class="pet-bubble" data-pet-hit role="status" aria-live="polite"><span class="bubble-spark"><Icon name="sparkle" :size="15" /></span><p>{{ loading ? t('loading') : bubble || t('welcome') }}</p><span v-if="busy" class="typing-dots" aria-hidden="true"><i /><i /><i /></span></div>
-      <button class="pet-avatar" data-pet-hit :disabled="loading || acting" :aria-label="t('pet')" :title="t('pet')" @click="run(c.pet)">
-        <img v-if="avatarVisible" :src="avatar" :alt="characterName" class="imported-avatar" @error="avatarBroken = true" />
-        <Mascot v-else :emotion="emotion" compact />
-      </button>
-      <div class="pet-caption" data-pet-hit><strong>{{ characterName }}</strong><span><Icon name="heart" :size="12" />{{ role?.bond ?? 0 }}</span></div>
-      <button v-if="!composerOpen" class="pet-fab" data-pet-hit :aria-label="t('chat')" :title="t('chat')" @click="openComposer"><Icon name="chat" :size="18" /></button>
-      <form v-else class="compact-composer" data-pet-hit @submit.prevent="submit">
-        <input ref="composer" v-model="draft" :aria-label="t('input')" :placeholder="t('input')" maxlength="5000" :disabled="loading" @keydown="onComposerKeydown" />
-        <button v-if="busy" type="button" class="send-button" :aria-label="t('stop')" :title="t('stop')" @click="stopReply"><Icon name="stop" :size="17" /></button>
-        <button v-else type="submit" class="send-button" :disabled="!canSend" :aria-label="t('send')" :title="t('send')"><Icon name="send" :size="18" /></button>
-        <button type="button" class="icon-button composer-collapse" :aria-label="t('close')" :title="t('close')" @click="composerOpen = false"><Icon name="down" :size="16" /></button>
-      </form>
-      <AgentControls v-if="c.agentMode.value && (composerOpen || c.agentActivity.value.permission || c.agentActivity.value.question)" class="compact-agent-status" :companion="c" compact />
-      <p v-if="explicitPreview" class="compact-notice">{{ t('preview') }}</p>
-      <p v-else-if="!host?.ai" class="compact-notice">{{ t('noHost') }}</p>
-    </section>
+    <DesktopPet v-if="active && !expanded" :companion="c" :native="hasNative" :preview="explicitPreview" :avatar="avatarVisible ? avatar : undefined" :notice-version="noticeVersion" @layout="petLayout = $event" @command="command => c.attempt(() => petCommand(command))" @broken="avatarBroken = true" />
 
     <section v-else-if="active" class="companion-window" :aria-label="t('app')">
       <header class="window-header drag-handle" :title="t('drag')" @pointerdown="dragWindow">
@@ -317,7 +265,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
     <div v-else-if="explicitPreview" class="closed-state"><Icon name="characters" :size="28" /><p>{{ t('close') }}</p><button class="button primary" @click="reopen">{{ t('resume') }}</button></div>
-    <div v-if="error" class="feedback error-feedback" data-pet-hit role="alert"><Icon name="shield" :size="17" /><p>{{ error }}</p><button class="icon-button" :aria-label="t('close')" @click="error = ''"><Icon name="close" :size="16" /></button></div>
-    <div v-if="toast" class="feedback toast-feedback" data-pet-hit role="status"><Icon name="check" :size="17" /><p>{{ toast }}</p><button class="icon-button" :aria-label="t('close')" @click="toast = ''"><Icon name="close" :size="15" /></button></div>
+    <div v-if="expanded && error" class="feedback error-feedback" data-pet-hit role="alert"><Icon name="shield" :size="17" /><p>{{ error }}</p><button class="icon-button" :aria-label="t('close')" @click="error = ''"><Icon name="close" :size="16" /></button></div>
+    <div v-if="expanded && toast" class="feedback toast-feedback" data-pet-hit role="status"><Icon name="check" :size="17" /><p>{{ toast }}</p><button class="icon-button" :aria-label="t('close')" @click="toast = ''"><Icon name="close" :size="15" /></button></div>
   </div>
 </template>

@@ -30,7 +30,7 @@ function selectModel(event: Event) { model.selectModel((event.target as HTMLSele
 onMounted(() => { if (available.value) void load(); });
 </script>
 <template>
-  <section class="surface settings-group">
+  <section class="surface settings-group" data-ai-model-settings>
     <div class="card-heading"><span class="icon-tile warm"><Icon name="sparkle" /></span><div><h3>{{ text.title }}</h3><p>{{ text.description }}</p></div><button class="button" :disabled="!available || loading || saving" @click="load">{{ loading ? text.loading : text.refresh }}</button></div>
     <p v-if="!available" class="hint">{{ text.unsupported }}</p>
     <template v-else>

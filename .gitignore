@@ -1,5 +1,8 @@
-node_modules/
+node_modules
+vendor/otools-plugin-sdk/node_modules
 dist/
+!vendor/otools-plugin-sdk/dist/
+!vendor/otools-plugin-sdk/dist/**
 dist-pack/
 public/onnx/
 target/

@@ -20,7 +20,7 @@ Requires Node >=22.12 and pnpm. This repository includes a pinned portable SDK p
 pnpm install --frozen-lockfile
 pnpm test
 pnpm build
-pnpm pack
+pnpm run pack
 ```
 
 The build copies local ONNX runtime assets from the installed dependency. It does **not** download emotion or voice weights.
@@ -36,7 +36,7 @@ Preview replies are examples, not live AI. Launch without `preview=1` from Otool
 
 Build `dist-pack/otools-lingchat-0.1.0.oplg`, then use Otools local plugin installation. Development management can bind this repository's `plugin.json` and use the configured development URL.
 
-The companion requires the host changes and SDK service types listed in `integration/`. Build/update the host before trying AI/data/observation. The companion has no AI API-key settings: configure the model in Otools, then check the connection from the plugin.
+The companion requires the host changes and SDK service types listed in `integration/`. Build/update the host before trying AI/data/observation. The companion has no AI API-key settings: configure the gateway in Otools, then use Settings → AI model to refresh the host-provided model list and choose a model and advertised reasoning effort. The host stores these preferences per plugin source + UUID. Leave the fields at their defaults to follow the host/service defaults. No capability is inferred from a model name.
 
 For Notes, first open the updated Notes plugin to migrate its existing origin-local records. Backups remain untouched. In **Plugin connections**, choose the currently listed providers and data types, then click **Connect selected data**. One host-owned consent window covers that explicit selection. Waiting for consent is not a connection: data appears only after approval and a successful authorized read. Denial, closing the consent window, or expiry ends the wait; a newly installed provider is never included automatically. Disconnect in the companion or revoke in Otools Settings → Data sharing. Enable background reminders separately.
 
@@ -63,7 +63,3 @@ See [UPSTREAM.md](UPSTREAM.md) for the exact revision, adaptation map and limita
 ## Corresponding source
 
 Source target: https://github.com/ootools/otools-lingchat . Release packages must link to the corresponding source revision and include this repository's build scripts, dependency lockfile, SDK source and host integration source/patches. Do not publish private saves, imported assets or credentials.
-
-## Optional host Agent mode
-
-Agent / tools mode is off by default. When explicitly enabled, LingChat uses the host-managed Codex or ACP service for foreground messages and only selected, currently authorized plugin tools. Codex uses this plugin's model and reasoning selection; ACP/native profiles retain their native configuration. Session/run links are separate from exported saves and permanent memory. Temporary notes and captures continue through ordinary AI for that turn. Closing, stopping or switching save/role cancels and closes owned foreground work. Requires an updated Otools host; real model inference and ACP task acceptance have not been performed.

@@ -1,0 +1,1712 @@
+diff --git a/crates/ot-ai-endpoints/src/lib.rs b/crates/ot-ai-endpoints/src/lib.rs
+index c6dd3de..76b85aa 100644
+--- a/crates/ot-ai-endpoints/src/lib.rs
++++ b/crates/ot-ai-endpoints/src/lib.rs
+@@ -31,7 +31,13 @@ pub enum EndpointError {
+     Parse(String),
+ }
+ 
+-/// 文本模型清单条目(capabilities 网关落地前可能缺失,均为可选)。
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ReasoningLevel {
++    pub effort: String,
++    pub description: String,
++}
++
++/// Model metadata is supplied by the endpoint; absent metadata stays unknown.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct ModelInfo {
+     pub id: String,
+@@ -40,6 +46,12 @@ pub struct ModelInfo {
+     /// 网关后续透出的模态能力(image.generate / video.generate / audio.generate …)
+     #[serde(default)]
+     pub capabilities: Vec<String>,
++    #[serde(default)]
++    pub supported_reasoning_levels: Vec<ReasoningLevel>,
++    #[serde(default)]
++    pub default_reasoning_level: Option<String>,
++    #[serde(default)]
++    pub context_window: Option<u64>,
+ }
+ 
+ /// 生图请求结果(响应恒 b64_json)。
+@@ -76,6 +88,7 @@ impl EndpointClient {
+             return Err(EndpointError::MissingBaseUrl);
+         }
+         let client = reqwest::Client::builder()
++            .redirect(reqwest::redirect::Policy::none())
+             .timeout(DEFAULT_TIMEOUT)
+             .build()
+             .map_err(|error| EndpointError::Client(error.to_string()))?;
+@@ -112,40 +125,32 @@ impl EndpointClient {
+ 
+     /// 模型清单(自检/配置 UI 拉取模型)。
+     pub async fn models(&self) -> Result<Vec<ModelInfo>, EndpointError> {
+-        let value = self
+-            .send_json(reqwest::Method::GET, "/v1/models", None)
+-            .await?;
+-        let models: Vec<ModelInfo> = value
++        let path = if self.base_url.ends_with("/v1") {
++            "/models"
++        } else {
++            "/v1/models"
++        };
++        self.models_at(path).await
++    }
++
++    /// OpenAI-compatible API bases may include arbitrary provider path prefixes.
++    pub async fn models_from_api_base(&self) -> Result<Vec<ModelInfo>, EndpointError> {
++        self.models_at("/models").await
++    }
++
++    async fn models_at(&self, path: &str) -> Result<Vec<ModelInfo>, EndpointError> {
++        let value = self.send_json(reqwest::Method::GET, path, None).await?;
++        let items = value
+             .get("data")
+             .and_then(Value::as_array)
+-            .map(|items| {
+-                items
+-                    .iter()
+-                    .filter_map(|item| {
+-                        let id = item.get("id")?.as_str()?.to_string();
+-                        Some(ModelInfo {
+-                            id,
+-                            owned_by: item
+-                                .get("owned_by")
+-                                .and_then(Value::as_str)
+-                                .unwrap_or_default()
+-                                .to_string(),
+-                            capabilities: item
+-                                .get("capabilities")
+-                                .and_then(Value::as_array)
+-                                .map(|caps| {
+-                                    caps.iter()
+-                                        .filter_map(Value::as_str)
+-                                        .map(str::to_string)
+-                                        .collect()
+-                                })
+-                                .unwrap_or_default(),
+-                        })
+-                    })
+-                    .collect()
+-            })
+             .ok_or_else(|| EndpointError::Parse("models 响应缺少 data 数组".to_string()))?;
+-        Ok(models)
++        items
++            .iter()
++            .map(|item| {
++                serde_json::from_value(item.clone())
++                    .map_err(|_| EndpointError::Parse("invalid model metadata".to_string()))
++            })
++            .collect()
+     }
+ 
+     /// 向量嵌入(返回每条输入的向量)。
+diff --git a/crates/ot-ai-endpoints/tests/endpoints.rs b/crates/ot-ai-endpoints/tests/endpoints.rs
+index d49956b..1d918fe 100644
+--- a/crates/ot-ai-endpoints/tests/endpoints.rs
++++ b/crates/ot-ai-endpoints/tests/endpoints.rs
+@@ -98,6 +98,33 @@ async fn models_parses_list_and_sends_bearer() {
+     assert!(models[1].capabilities.is_empty());
+ }
+ 
++#[tokio::test]
++async fn models_preserves_reasoning_metadata_and_accepts_versioned_base() {
++    let (base, handle) = mock_server(
++        "200 OK",
++        r#"{"object":"list","data":[{"id":"codex","object":"model","owned_by":"ai-switch","capabilities":[],"supported_reasoning_levels":[{"effort":"xhigh","description":"Extended"},{"effort":"ultra","description":"Maximum"}],"default_reasoning_level":"xhigh","context_window":200000},{"id":"legacy"}]}"#,
++        &[("Content-Type", "application/json")],
++    );
++    let models = EndpointClient::new(&format!("{base}/v1/"), "private-key")
++        .unwrap()
++        .models()
++        .await
++        .unwrap();
++    let request = handle.join().unwrap();
++    assert_eq!(request[0], "GET /v1/models HTTP/1.1");
++    assert_eq!(auth_header(&request).as_deref(), Some("Bearer private-key"));
++    let wire = serde_json::to_value(&models).unwrap();
++    assert_eq!(
++        wire[0]["supported_reasoning_levels"][1],
++        json!({"effort":"ultra","description":"Maximum"})
++    );
++    assert_eq!(wire[0]["default_reasoning_level"], "xhigh");
++    assert_eq!(wire[0]["context_window"], 200000);
++    assert_eq!(wire[1]["supported_reasoning_levels"], json!([]));
++    assert_eq!(wire[1]["default_reasoning_level"], Value::Null);
++    assert_eq!(wire[1]["context_window"], Value::Null);
++}
++
+ #[tokio::test]
+ async fn embeddings_returns_ordered_vectors() {
+     let (base, handle) = mock_server(
+diff --git a/crates/ot-ai-generate-text/Cargo.toml b/crates/ot-ai-generate-text/Cargo.toml
+index 5ee5042..3035a7d 100644
+--- a/crates/ot-ai-generate-text/Cargo.toml
++++ b/crates/ot-ai-generate-text/Cargo.toml
+@@ -13,3 +13,9 @@ ot-otools-config = { path = "../ot-otools-config" }
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ tokio = { version = "1.0", features = ["full"] }
++
++[dev-dependencies]
++ot-ai-endpoints = { path = "../ot-ai-endpoints" }
++ot-storage = { path = "../ot-storage" }
++base64 = "0.22"
++tempfile = "3"
+diff --git a/crates/ot-ai-generate-text/src/ai_switch.rs b/crates/ot-ai-generate-text/src/ai_switch.rs
+index 0560dfc..0abcc99 100644
+--- a/crates/ot-ai-generate-text/src/ai_switch.rs
++++ b/crates/ot-ai-generate-text/src/ai_switch.rs
+@@ -57,7 +57,14 @@ impl AiSwitchConfig {
+         }
+         Some(OtoolsAiSettings {
+             provider: "openai".to_string(),
+-            base_url: format!("{}/v1", self.root()),
++            base_url: {
++                let root = self.root();
++                if root.ends_with("/v1") {
++                    root
++                } else {
++                    format!("{root}/v1")
++                }
++            },
+             api_key: self.api_key.clone(),
+             model: model.to_string(),
+         })
+@@ -90,6 +97,22 @@ mod tests {
+         assert_eq!(settings.model, "gpt-x");
+     }
+ 
++    #[test]
++    fn text_settings_does_not_duplicate_an_existing_api_version() {
++        let config = AiSwitchConfig {
++            base_url: "http://127.0.0.1:19527/v1/".into(),
++            api_key: "key".into(),
++            endpoints: AiSwitchEndpoints {
++                text: "chosen".into(),
++                ..Default::default()
++            },
++        };
++        assert_eq!(
++            config.text_settings().unwrap().base_url,
++            "http://127.0.0.1:19527/v1"
++        );
++    }
++
+     #[test]
+     fn text_settings_requires_model() {
+         let config = AiSwitchConfig {
+diff --git a/crates/ot-ai-generate-text/src/conversation.rs b/crates/ot-ai-generate-text/src/conversation.rs
+index 00fa624..9e254f7 100644
+--- a/crates/ot-ai-generate-text/src/conversation.rs
++++ b/crates/ot-ai-generate-text/src/conversation.rs
+@@ -2,8 +2,8 @@
+ //! after validation; this wire request deliberately has no provider/credential fields.
+ use crate::{build_azure_config, build_openai_config, OtoolsAiSettings};
+ use async_openai::types::{CreateChatCompletionRequest, CreateChatCompletionStreamResponse};
+-use reqwest_eventsource::{Event, RequestBuilderExt};
+ use futures::StreamExt;
++use reqwest_eventsource::{Event, RequestBuilderExt};
+ use serde::{Deserialize, Serialize};
+ use serde_json::json;
+ 
+@@ -43,6 +43,10 @@ pub struct AiRequest {
+     pub messages: Vec<AiMessage>,
+     pub temperature: Option<f32>,
+     pub max_tokens: Option<u16>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub model: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub reasoning_effort: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize)]
+@@ -63,7 +67,9 @@ pub enum AiRole {
+ #[derive(Debug, Clone, Deserialize, Serialize)]
+ #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+ pub enum AiContent {
+-    Text { text: String },
++    Text {
++        text: String,
++    },
+     Image {
+         #[serde(rename = "captureImageId")]
+         capture_image_id: String,
+@@ -75,41 +81,73 @@ impl AiRequest {
+         if self.messages.is_empty() || self.messages.len() > 128 {
+             return Err("invalidMessages".into());
+         }
+-        if self.temperature.is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
++        if self
++            .temperature
++            .is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
+             || self.max_tokens == Some(0)
+         {
+             return Err("invalidParameters".into());
+         }
++        if self.model.as_ref().is_some_and(|value| {
++            value.trim().is_empty()
++                || value.len() > 512
++                || value.trim() != value
++                || value.chars().any(char::is_control)
++        }) || self.reasoning_effort.as_ref().is_some_and(|value| {
++            value.trim().is_empty()
++                || value.len() > 64
++                || value.trim() != value
++                || value.chars().any(char::is_control)
++        }) {
++            return Err("invalidParameters".into());
++        }
+         let mut bytes = 0usize;
+         let mut parts = 0usize;
+         let mut images = 0usize;
+         for message in &self.messages {
+-            if message.content.is_empty() { return Err("emptyMessage".into()); }
++            if message.content.is_empty() {
++                return Err("emptyMessage".into());
++            }
+             for part in &message.content {
+                 parts += 1;
+                 match part {
+-                    AiContent::Text { text } => { bytes = bytes.saturating_add(text.len()); }
++                    AiContent::Text { text } => {
++                        bytes = bytes.saturating_add(text.len());
++                    }
+                     AiContent::Image { capture_image_id } => {
+                         images += 1;
+-                        if message.role != AiRole::User || capture_image_id.is_empty() || capture_image_id.len() > 256 {
++                        if message.role != AiRole::User
++                            || capture_image_id.is_empty()
++                            || capture_image_id.len() > 256
++                        {
+                             return Err("invalidImageReference".into());
+                         }
+                     }
+                 }
+             }
+         }
+-        if bytes > 1024 * 1024 || parts > 256 || images > 8 { return Err("requestTooLarge".into()); }
++        if bytes > 1024 * 1024 || parts > 256 || images > 8 {
++            return Err("requestTooLarge".into());
++        }
+         Ok(())
+     }
+ }
+ 
++/// Validated messages with an open-ended reasoning effort on the final wire body.
++/// async-openai 0.28's effort enum cannot represent gateway xhigh/max/ultra.
++#[derive(Debug, Serialize)]
++#[serde(transparent)]
++pub struct PreparedRequest(serde_json::Value);
++
+ pub fn prepare_request(
+     request: &AiRequest,
+     model: &str,
+     mut resolve_image: impl FnMut(&str) -> Result<String, String>,
+-) -> Result<CreateChatCompletionRequest, String> {
++) -> Result<PreparedRequest, String> {
+     request.validate()?;
+-    if model.trim().is_empty() { return Err("modelNotConfigured".into()); }
++    if model.trim().is_empty() {
++        return Err("modelNotConfigured".into());
++    }
+     let mut messages = Vec::with_capacity(request.messages.len());
+     for message in &request.messages {
+         let mut parts = Vec::with_capacity(message.content.len());
+@@ -118,7 +156,9 @@ pub fn prepare_request(
+                 AiContent::Text { text } => json!({"type":"text","text":text}),
+                 AiContent::Image { capture_image_id } => {
+                     let data_url = resolve_image(capture_image_id)?;
+-                    if !data_url.starts_with("data:image/png;base64,") { return Err("invalidCaptureImage".into()); }
++                    if !data_url.starts_with("data:image/png;base64,") {
++                        return Err("invalidCaptureImage".into());
++                    }
+                     json!({"type":"image_url","image_url":{"url":data_url}})
+                 }
+             });
+@@ -126,14 +166,26 @@ pub fn prepare_request(
+         messages.push(json!({"role":message.role,"content":parts}));
+     }
+     let mut wire = json!({"model":model.trim(),"messages":messages,"stream":true});
+-    if let Some(value) = request.temperature { wire["temperature"] = json!(value); }
+-    if let Some(value) = request.max_tokens { wire["max_tokens"] = json!(value); }
+-    serde_json::from_value(wire).map_err(|_| "invalidMessages".into())
++    if let Some(value) = request.temperature {
++        wire["temperature"] = json!(value);
++    }
++    if let Some(value) = request.max_tokens {
++        wire["max_tokens"] = json!(value);
++    }
++    let typed: CreateChatCompletionRequest =
++        serde_json::from_value(wire).map_err(|_| "invalidMessages".to_owned())?;
++    let mut wire = serde_json::to_value(typed).map_err(|_| "invalidMessages".to_owned())?;
++    if let Some(effort) = &request.reasoning_effort {
++        wire["reasoning_effort"] = json!(effort);
++    } else {
++        wire.as_object_mut().unwrap().remove("reasoning_effort");
++    }
++    Ok(PreparedRequest(wire))
+ }
+ 
+ async fn stream_with_config<C: async_openai::config::Config>(
+     config: C,
+-    request: CreateChatCompletionRequest,
++    request: PreparedRequest,
+     mut on_delta: impl FnMut(&str) -> Result<(), String>,
+ ) -> Result<(), String> {
+     // async-openai 0.28's create_stream detaches an unbounded worker. Own the
+@@ -141,31 +193,49 @@ async fn stream_with_config<C: async_openai::config::Config>(
+     let client = reqwest::Client::builder()
+         .redirect(reqwest::redirect::Policy::none())
+         .connect_timeout(std::time::Duration::from_secs(30))
+-        .build().map_err(|_| "providerFailed".to_owned())?;
+-    let mut stream = client.post(config.url("/chat/completions"))
+-        .headers(config.headers()).query(&config.query()).json(&request)
+-        .eventsource().map_err(|_| "providerFailed".to_owned())?;
++        .build()
++        .map_err(|_| "providerFailed".to_owned())?;
++    let mut stream = client
++        .post(config.url("/chat/completions"))
++        .headers(config.headers())
++        .query(&config.query())
++        .json(&request)
++        .eventsource()
++        .map_err(|_| "providerFailed".to_owned())?;
+     stream.set_retry_policy(Box::new(reqwest_eventsource::retry::Never));
+     let mut has_text = false;
+     let mut completed = false;
+     while let Some(event) = stream.next().await {
+         // Never expose provider error bodies, which can echo credentials/inputs.
+         let event = event.map_err(|_| "providerStreamFailed".to_owned())?;
+-        let Event::Message(message) = event else { continue; };
+-        if message.data == "[DONE]" { completed = true; break; }
+-        if message.data.len() > 256 * 1024 { return Err("providerEventTooLarge".into()); }
+-        let chunk: CreateChatCompletionStreamResponse = serde_json::from_str(&message.data)
+-            .map_err(|_| "providerStreamFailed".to_owned())?;
++        let Event::Message(message) = event else {
++            continue;
++        };
++        if message.data == "[DONE]" {
++            completed = true;
++            break;
++        }
++        if message.data.len() > 256 * 1024 {
++            return Err("providerEventTooLarge".into());
++        }
++        let chunk: CreateChatCompletionStreamResponse =
++            serde_json::from_str(&message.data).map_err(|_| "providerStreamFailed".to_owned())?;
+         for choice in chunk.choices {
+-            if choice.index != 0 { continue; }
++            if choice.index != 0 {
++                continue;
++            }
+             if let Some(delta) = choice.delta.content.filter(|text| !text.is_empty()) {
+                 has_text |= !delta.trim().is_empty();
+                 on_delta(&delta)?;
+             }
+         }
+     }
+-    if !completed { return Err("providerStreamFailed".into()); }
+-    if !has_text { return Err("emptyResponse".into()); }
++    if !completed {
++        return Err("providerStreamFailed".into());
++    }
++    if !has_text {
++        return Err("emptyResponse".into());
++    }
+     Ok(())
+ }
+ 
+@@ -173,11 +243,12 @@ async fn stream_with_config<C: async_openai::config::Config>(
+ /// stream (unlike legacy generate_text's detached worker), enabling cancellation.
+ pub async fn stream_conversation(
+     settings: &OtoolsAiSettings,
+-    request: CreateChatCompletionRequest,
++    request: PreparedRequest,
+     on_delta: impl FnMut(&str) -> Result<(), String>,
+ ) -> Result<(), String> {
+     if settings.provider == "azure" {
+-        let config = build_azure_config(settings).map_err(|_| "invalidHostConfiguration".to_owned())?;
++        let config =
++            build_azure_config(settings).map_err(|_| "invalidHostConfiguration".to_owned())?;
+         stream_with_config(config, request, on_delta).await
+     } else {
+         stream_with_config(build_openai_config(settings), request, on_delta).await
+diff --git a/crates/ot-ai-generate-text/tests/conversation.rs b/crates/ot-ai-generate-text/tests/conversation.rs
+index 026beae..d3f1163 100644
+--- a/crates/ot-ai-generate-text/tests/conversation.rs
++++ b/crates/ot-ai-generate-text/tests/conversation.rs
+@@ -3,7 +3,9 @@ use ot_ai_generate_text::OtoolsAiSettings;
+ use serde_json::{json, Value};
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ 
+-fn request(value: Value) -> AiRequest { serde_json::from_value(value).unwrap() }
++fn request(value: Value) -> AiRequest {
++    serde_json::from_value(value).unwrap()
++}
+ 
+ #[test]
+ fn preserves_roles_text_whitespace_and_owned_image_resolution() {
+@@ -17,11 +19,18 @@ fn preserves_roles_text_whitespace_and_owned_image_resolution() {
+     let built = prepare_request(&input, "host-model", |id| {
+         resolved.push(id.to_owned());
+         Ok("data:image/png;base64,aGVsbG8=".to_owned())
+-    }).unwrap();
++    })
++    .unwrap();
+     let wire = serde_json::to_value(built).unwrap();
+     assert_eq!(resolved, ["owned-image"]);
+-    assert_eq!(wire["messages"][0], json!({"role":"system","content":[{"type":"text","text":" rules "}]}));
+-    assert_eq!(wire["messages"][1]["content"][1], json!({"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8=","detail":null}}));
++    assert_eq!(
++        wire["messages"][0],
++        json!({"role":"system","content":[{"type":"text","text":" rules "}]})
++    );
++    assert_eq!(
++        wire["messages"][1]["content"][1],
++        json!({"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8=","detail":null}})
++    );
+     assert_eq!(wire["messages"][2]["role"], "assistant");
+     assert_eq!(wire["messages"][3]["content"][0]["text"], "continue");
+     assert_eq!(wire["model"], "host-model");
+@@ -31,12 +40,15 @@ fn preserves_roles_text_whitespace_and_owned_image_resolution() {
+ 
+ #[test]
+ fn rejects_credentials_urls_invalid_parameters_and_non_user_images() {
+-    for field in ["apiKey", "provider", "model", "baseUrl"] {
++    for field in ["apiKey", "provider", "baseUrl", "reasoning_effort"] {
+         let mut value = json!({"messages":[]});
+         value[field] = json!("plugin-controlled");
+         assert!(serde_json::from_value::<AiRequest>(value).is_err());
+     }
+-    assert!(serde_json::from_value::<AiRequest>(json!({"messages":[{"role":"user","content":[{"type":"image","url":"http://private"}]}]})).is_err());
++    assert!(serde_json::from_value::<AiRequest>(
++        json!({"messages":[{"role":"user","content":[{"type":"image","url":"http://private"}]}]})
++    )
++    .is_err());
+     for value in [
+         json!({"messages":[]}),
+         json!({"messages":[{"role":"user","content":[]}]}),
+@@ -44,18 +56,34 @@ fn rejects_credentials_urls_invalid_parameters_and_non_user_images() {
+         json!({"messages":[{"role":"user","content":[{"type":"text","text":"x"}]}],"temperature":3}),
+         json!({"messages":[{"role":"user","content":[{"type":"text","text":"x"}]}],"maxTokens":0}),
+     ] {
+-        assert!(prepare_request(&request(value), "model", |_| panic!("invalid requests must not resolve images")).is_err());
++        assert!(prepare_request(&request(value), "model", |_| panic!(
++            "invalid requests must not resolve images"
++        ))
++        .is_err());
+     }
+-    let image = request(json!({"messages":[{"role":"user","content":[{"type":"image","captureImageId":"foreign"}]}]}));
+-    assert_eq!(prepare_request(&image, "model", |_| Err("forbidden".into())).unwrap_err(), "forbidden");
++    let image = request(
++        json!({"messages":[{"role":"user","content":[{"type":"image","captureImageId":"foreign"}]}]}),
++    );
++    assert_eq!(
++        prepare_request(&image, "model", |_| Err("forbidden".into())).unwrap_err(),
++        "forbidden"
++    );
+ }
+ 
+ #[test]
+ fn capabilities_report_resolved_model_without_claiming_vision_support_or_exposing_secrets() {
+     use ot_ai_generate_text::conversation::AiCapabilities;
+-    let settings = OtoolsAiSettings { provider: "openai".into(), base_url: "http://host-private".into(), api_key: "host-secret".into(), model: "vision-sounding-name".into() };
++    let settings = OtoolsAiSettings {
++        provider: "openai".into(),
++        base_url: "http://host-private".into(),
++        api_key: "host-secret".into(),
++        model: "vision-sounding-name".into(),
++    };
+     let value = serde_json::to_value(AiCapabilities::from_settings(Some(&settings))).unwrap();
+-    assert_eq!(value, json!({"configured":true,"provider":"openai","model":"vision-sounding-name","streaming":true,"cancellation":true,"vision":"unknown"}));
++    assert_eq!(
++        value,
++        json!({"configured":true,"provider":"openai","model":"vision-sounding-name","streaming":true,"cancellation":true,"vision":"unknown"})
++    );
+     let missing = serde_json::to_value(AiCapabilities::from_settings(None)).unwrap();
+     assert_eq!(missing["configured"], false);
+     assert_eq!(missing["reason"], "invalidHostConfiguration");
+@@ -73,17 +101,36 @@ async fn dropping_inference_closes_a_stalled_provider_connection() {
+         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+         opened.send(()).unwrap();
+         let mut byte = [0];
+-        match tokio::time::timeout(std::time::Duration::from_millis(500), socket.read(&mut byte)).await
+-            .expect("cancel must close the socket without waiting for the next SSE token") {
++        match tokio::time::timeout(
++            std::time::Duration::from_millis(500),
++            socket.read(&mut byte),
++        )
++        .await
++        .expect("cancel must close the socket without waiting for the next SSE token")
++        {
+             Ok(0) => true,
+-            Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => true,
++            Err(error)
++                if matches!(
++                    error.kind(),
++                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
++                ) =>
++            {
++                true
++            }
+             other => panic!("cancel left the provider connection open: {other:?}"),
+         }
+     });
+-    let settings = OtoolsAiSettings { provider:"openai".into(), base_url:format!("http://{address}/v1"), api_key:"host".into(), model:"m".into() };
+-    let input = request(json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}));
+-    let built = prepare_request(&input,"m", |_| unreachable!()).unwrap();
+-    let worker = tokio::spawn(async move { stream_conversation(&settings,built, |_| Ok(())).await });
++    let settings = OtoolsAiSettings {
++        provider: "openai".into(),
++        base_url: format!("http://{address}/v1"),
++        api_key: "host".into(),
++        model: "m".into(),
++    };
++    let input =
++        request(json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}));
++    let built = prepare_request(&input, "m", |_| unreachable!()).unwrap();
++    let worker =
++        tokio::spawn(async move { stream_conversation(&settings, built, |_| Ok(())).await });
+     wait_open.await.unwrap();
+     worker.abort();
+     let _ = worker.await;
+@@ -92,6 +139,13 @@ async fn dropping_inference_closes_a_stalled_provider_connection() {
+ 
+ #[tokio::test]
+ async fn streams_real_sse_in_order_and_keeps_model_credentials_host_side() {
++    verify_wire(None).await;
++    for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
++        verify_wire(Some(effort)).await;
++    }
++}
++
++async fn verify_wire(effort: Option<&'static str>) {
+     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+     let address = listener.local_addr().unwrap();
+     let server = tokio::spawn(async move {
+@@ -109,7 +163,13 @@ async fn streams_real_sse_in_order_and_keeps_model_credentials_host_side() {
+             }
+         }
+         let headers = String::from_utf8_lossy(&raw[..body_start]).to_ascii_lowercase();
+-        let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().trim().parse().unwrap();
++        let length: usize = headers
++            .lines()
++            .find_map(|line| line.strip_prefix("content-length: "))
++            .unwrap()
++            .trim()
++            .parse()
++            .unwrap();
+         while raw.len() < body_start + length {
+             let mut buf = [0; 4096];
+             let n = socket.read(&mut buf).await.unwrap();
+@@ -118,7 +178,19 @@ async fn streams_real_sse_in_order_and_keeps_model_credentials_host_side() {
+         }
+         assert!(headers.contains("authorization: bearer host-secret"));
+         let wire: Value = serde_json::from_slice(&raw[body_start..body_start + length]).unwrap();
+-        assert_eq!(wire["model"], "configured-model");
++        assert_eq!(
++            wire["model"],
++            if effort.is_some() {
++                "selected-model"
++            } else {
++                "configured-model"
++            }
++        );
++        if let Some(effort) = effort {
++            assert_eq!(wire["reasoning_effort"], effort);
++        } else {
++            assert!(wire.get("reasoning_effort").is_none());
++        }
+         assert_eq!(wire["messages"][0]["role"], "user");
+         let response = concat!(
+             "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\n",
+@@ -127,11 +199,31 @@ async fn streams_real_sse_in_order_and_keeps_model_credentials_host_side() {
+         );
+         socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).as_bytes()).await.unwrap();
+     });
+-    let settings = OtoolsAiSettings { provider: "openai".into(), base_url: format!("http://{address}/v1"), api_key: "host-secret".into(), model: "configured-model".into() };
+-    let input = request(json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}));
+-    let built = prepare_request(&input, &settings.model, |_| unreachable!()).unwrap();
++    let settings = OtoolsAiSettings {
++        provider: "openai".into(),
++        base_url: format!("http://{address}/v1"),
++        api_key: "host-secret".into(),
++        model: "configured-model".into(),
++    };
++    let mut value = json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
++    if let Some(effort) = effort {
++        value["model"] = json!("selected-model");
++        value["reasoningEffort"] = json!(effort);
++    }
++    let input = request(value);
++    let model = if effort.is_some() {
++        "selected-model"
++    } else {
++        &settings.model
++    };
++    let built = prepare_request(&input, model, |_| unreachable!()).unwrap();
+     let mut deltas = vec![];
+-    stream_conversation(&settings, built, |delta| { deltas.push(delta.to_owned()); Ok(()) }).await.unwrap();
++    stream_conversation(&settings, built, |delta| {
++        deltas.push(delta.to_owned());
++        Ok(())
++    })
++    .await
++    .unwrap();
+     assert_eq!(deltas, ["hello ", "world"]);
+     server.await.unwrap();
+ }
+diff --git a/crates/ot-ai-generate-text/tests/jobs.rs b/crates/ot-ai-generate-text/tests/jobs.rs
+index 0cb727b..d77a6c6 100644
+--- a/crates/ot-ai-generate-text/tests/jobs.rs
++++ b/crates/ot-ai-generate-text/tests/jobs.rs
+@@ -1,9 +1,15 @@
+ // Exercise the production host queue without compiling Tauri and its desktop dependencies.
+ #[path = "../../../src-tauri/src/platform/ai/queue.rs"]
+ mod queue;
+-use queue::{JobOwner, JobRegistry, MAX_EVENTS, MAX_QUEUE_BYTES, MAX_JOBS};
++use queue::{JobOwner, JobRegistry, MAX_EVENTS, MAX_JOBS, MAX_QUEUE_BYTES};
+ 
+-fn owner(label: &str) -> JobOwner { JobOwner { label: label.into(), source: "market".into(), uuid: "pet".into() } }
++fn owner(label: &str) -> JobOwner {
++    JobOwner {
++        label: label.into(),
++        source: "market".into(),
++        uuid: "pet".into(),
++    }
++}
+ 
+ #[test]
+ fn private_queue_preserves_sequence_and_terminal_once() {
+@@ -17,10 +23,27 @@ fn private_queue_preserves_sequence_and_terminal_once() {
+     assert!(jobs.delta("a", "late", 0).is_err());
+     let result = jobs.read(&owner, "a", 0).unwrap();
+     assert!(result.done);
+-    assert_eq!(result.events.iter().map(|e| (e.sequence, e.kind.as_str(), e.text.as_deref())).collect::<Vec<_>>(), [(1,"delta",Some("one")),(2,"delta",Some("two")),(3,"done",None)]);
++    assert_eq!(
++        result
++            .events
++            .iter()
++            .map(|e| (e.sequence, e.kind.as_str(), e.text.as_deref()))
++            .collect::<Vec<_>>(),
++        [
++            (1, "delta", Some("one")),
++            (2, "delta", Some("two")),
++            (3, "done", None)
++        ]
++    );
+     assert!(jobs.read(&owner, "a", 3).unwrap().events.is_empty());
+-    assert!(jobs.read(&owner, "a", 0).is_err(), "acknowledged history must report a cursor gap");
+-    assert!(jobs.read(&owner, "a", 4).is_err(), "future cursors cannot discard unreceived data");
++    assert!(
++        jobs.read(&owner, "a", 0).is_err(),
++        "acknowledged history must report a cursor gap"
++    );
++    assert!(
++        jobs.read(&owner, "a", 4).is_err(),
++        "future cursors cannot discard unreceived data"
++    );
+ }
+ 
+ #[test]
+@@ -29,11 +52,26 @@ fn denies_other_window_source_or_plugin_without_draining() {
+     let mine = owner("pet");
+     jobs.start("private".into(), mine.clone(), 0).unwrap();
+     jobs.delta("private", "secret response", 0).unwrap();
+-    for other in [owner("other-window"), JobOwner { source:"dev".into(), ..mine.clone() }, JobOwner { uuid:"other".into(), ..mine.clone() }] {
++    for other in [
++        owner("other-window"),
++        JobOwner {
++            source: "dev".into(),
++            ..mine.clone()
++        },
++        JobOwner {
++            uuid: "other".into(),
++            ..mine.clone()
++        },
++    ] {
+         assert!(jobs.read(&other, "private", 1).is_err());
+         assert!(jobs.cancel(&other, "private", 1).is_err());
+     }
+-    assert_eq!(jobs.read(&mine, "private", 0).unwrap().events[0].text.as_deref(), Some("secret response"));
++    assert_eq!(
++        jobs.read(&mine, "private", 0).unwrap().events[0]
++            .text
++            .as_deref(),
++        Some("secret response")
++    );
+ }
+ 
+ #[tokio::test]
+@@ -42,14 +80,19 @@ async fn cancellation_wakes_worker_and_discards_late_output() {
+     let mine = owner("pet");
+     let cancellation = jobs.start("a".into(), mine.clone(), 0).unwrap();
+     jobs.cancel(&mine, "a", 1).unwrap();
+-    tokio::time::timeout(std::time::Duration::from_millis(50), cancellation.cancelled()).await.unwrap();
++    tokio::time::timeout(
++        std::time::Duration::from_millis(50),
++        cancellation.cancelled(),
++    )
++    .await
++    .unwrap();
+     jobs.cancel(&mine, "a", 2).unwrap();
+     assert!(jobs.delta("a", "late secret", 0).is_err());
+     jobs.finish("a", None, 3);
+-    let result = jobs.read(&mine,"a",0).unwrap();
++    let result = jobs.read(&mine, "a", 0).unwrap();
+     assert!(result.done);
+-    assert_eq!(result.events.len(),1);
+-    assert_eq!(result.events[0].kind,"cancelled");
++    assert_eq!(result.events.len(), 1);
++    assert_eq!(result.events[0].kind, "cancelled");
+ }
+ 
+ #[tokio::test]
+@@ -57,30 +100,41 @@ async fn overflow_stops_worker_with_explicit_error_without_silent_loss() {
+     let mut jobs = JobRegistry::default();
+     let mine = owner("pet");
+     let cancellation = jobs.start("a".into(), mine.clone(), 0).unwrap();
+-    for _ in 0..MAX_EVENTS - 1 { jobs.delta("a","x", 0).unwrap(); }
+-    assert!(jobs.delta("a","overflow", 0).is_err());
++    for _ in 0..MAX_EVENTS - 1 {
++        jobs.delta("a", "x", 0).unwrap();
++    }
++    assert!(jobs.delta("a", "overflow", 0).is_err());
+     cancellation.cancelled().await;
+-    let result = jobs.read(&mine,"a",0).unwrap();
+-    assert_eq!(result.events.len(),MAX_EVENTS);
++    let result = jobs.read(&mine, "a", 0).unwrap();
++    assert_eq!(result.events.len(), MAX_EVENTS);
+     assert!(result.done);
+-    assert_eq!(result.events.last().unwrap().error.as_deref(),Some("backlogExceeded"));
++    assert_eq!(
++        result.events.last().unwrap().error.as_deref(),
++        Some("backlogExceeded")
++    );
+     jobs.start("b".into(), mine.clone(), 0).unwrap();
+-    assert!(jobs.delta("b",&"x".repeat(MAX_QUEUE_BYTES + 1), 0).is_err());
+-    assert_eq!(jobs.read(&mine,"b",0).unwrap().events[0].kind,"error");
++    assert!(jobs
++        .delta("b", &"x".repeat(MAX_QUEUE_BYTES + 1), 0)
++        .is_err());
++    assert_eq!(jobs.read(&mine, "b", 0).unwrap().events[0].kind, "error");
+ }
+ 
+ #[test]
+ fn bounds_job_count_and_reclaims_closed_expired_jobs() {
+     let mut jobs = JobRegistry::default();
+-    for i in 0..MAX_JOBS { jobs.start(i.to_string(),owner(&i.to_string()),0).unwrap(); }
+-    assert!(jobs.start("overflow".into(),owner("pet"),0).is_err());
++    for i in 0..MAX_JOBS {
++        jobs.start(i.to_string(), owner(&i.to_string()), 0).unwrap();
++    }
++    assert!(jobs.start("overflow".into(), owner("pet"), 0).is_err());
+     jobs.remove_owner("0");
+-    assert!(jobs.start("replacement".into(),owner("pet"),0).is_ok());
++    assert!(jobs.start("replacement".into(), owner("pet"), 0).is_ok());
+     jobs.prune(11 * 60 * 1000);
+-    assert!(jobs.read(&owner("pet"),"replacement",0).is_err());
+-    assert!(jobs.start("new".into(),owner("pet"),11 * 60 * 1000).is_ok());
++    assert!(jobs.read(&owner("pet"), "replacement", 0).is_err());
++    assert!(jobs
++        .start("new".into(), owner("pet"), 11 * 60 * 1000)
++        .is_ok());
+     jobs.shutdown();
+-    assert!(jobs.read(&owner("pet"),"new",0).is_err());
++    assert!(jobs.read(&owner("pet"), "new", 0).is_err());
+ }
+ 
+ #[test]
+@@ -89,23 +143,50 @@ fn terminal_acknowledgement_releases_capacity_and_expiry_uses_actual_finish_time
+     let mine = owner("pet");
+     for i in 0..10 {
+         let id = i.to_string();
+-        jobs.start(id.clone(),mine.clone(),0).unwrap();
+-        jobs.finish(&id,None,1);
+-        assert!(jobs.read(&mine,&id,1).unwrap().events.is_empty());
++        jobs.start(id.clone(), mine.clone(), 0).unwrap();
++        jobs.finish(&id, None, 1);
++        assert!(jobs.read(&mine, &id, 1).unwrap().events.is_empty());
+     }
+-    jobs.start("overflow".into(),mine.clone(),0).unwrap();
+-    assert!(jobs.delta("overflow", &"x".repeat(MAX_QUEUE_BYTES + 1), 120_000).is_err());
++    jobs.start("overflow".into(), mine.clone(), 0).unwrap();
++    assert!(jobs
++        .delta("overflow", &"x".repeat(MAX_QUEUE_BYTES + 1), 120_000)
++        .is_err());
+     jobs.prune(120_001);
+-    assert!(jobs.read(&mine,"overflow",0).unwrap().done);
++    assert!(jobs.read(&mine, "overflow", 0).unwrap().done);
+     jobs.prune(180_001);
+-    assert!(jobs.read(&mine,"overflow",0).is_err());
++    assert!(jobs.read(&mine, "overflow", 0).is_err());
++}
++
++#[tokio::test]
++async fn cancelled_catalog_lookup_never_reaches_inference() {
++    let mut jobs = JobRegistry::default();
++    let mine = owner("pet");
++    let stop = jobs.start("catalog".into(), mine.clone(), 0).unwrap();
++    let (ready, received) = tokio::sync::oneshot::channel::<()>();
++    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let observed = called.clone();
++    let worker = tokio::spawn(async move {
++        tokio::select! {
++            biased;
++            _ = stop.cancelled() => {},
++            _ = async { let _ = received.await; observed.store(true, std::sync::atomic::Ordering::SeqCst); } => {},
++        }
++    });
++    jobs.cancel(&mine, "catalog", 1).unwrap();
++    let _ = ready.send(());
++    worker.await.unwrap();
++    assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
++    assert_eq!(
++        jobs.read(&mine, "catalog", 0).unwrap().events[0].kind,
++        "cancelled"
++    );
+ }
+ 
+ #[tokio::test]
+ async fn dropping_closed_owner_jobs_cancels_outstanding_network_future() {
+     let mut jobs = JobRegistry::default();
+-    let stop = jobs.start("a".into(),owner("closing"),0).unwrap();
++    let stop = jobs.start("a".into(), owner("closing"), 0).unwrap();
+     jobs.remove_owner("closing");
+     stop.cancelled().await;
+-    assert!(jobs.read(&owner("closing"),"a",0).is_err());
++    assert!(jobs.read(&owner("closing"), "a", 0).is_err());
+ }
+diff --git a/crates/ot-ai-generate-text/tests/selection.rs b/crates/ot-ai-generate-text/tests/selection.rs
+new file mode 100644
+index 0000000..6844016
+--- /dev/null
++++ b/crates/ot-ai-generate-text/tests/selection.rs
+@@ -0,0 +1,155 @@
++#[path = "../../../src-tauri/src/platform/ai/queue.rs"]
++mod queue;
++#[path = "../../../src-tauri/src/platform/ai/settings.rs"]
++mod settings;
++use ot_ai_generate_text::conversation::AiRequest;
++use queue::JobOwner;
++use serde_json::json;
++use settings::{load_selection, save_selection, AiModelInfo, AiSelection};
++
++fn owner(source: &str, uuid: &str) -> JobOwner {
++    JobOwner {
++        source: source.into(),
++        uuid: uuid.into(),
++        label: "window-a".into(),
++    }
++}
++fn catalog() -> Vec<AiModelInfo> {
++    vec![
++        AiModelInfo {
++            id: "model-a".into(),
++            owned_by: "ai-switch".into(),
++            capabilities: vec![],
++            reasoning_levels: vec![ot_ai_endpoints::ReasoningLevel {
++                effort: "ultra".into(),
++                description: "Deep".into(),
++            }],
++            default_reasoning_level: Some("ultra".into()),
++            context_window: Some(200000),
++        },
++        AiModelInfo {
++            id: "model-b".into(),
++            owned_by: "ai-switch".into(),
++            capabilities: vec![],
++            reasoning_levels: vec![],
++            default_reasoning_level: None,
++            context_window: None,
++        },
++    ]
++}
++fn request(model: Option<&str>, reasoning: Option<&str>) -> AiRequest {
++    serde_json::from_value(json!({"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}],"model":model,"reasoningEffort":reasoning})).unwrap()
++}
++#[test]
++fn selection_persists_across_windows_but_not_sources_or_plugins() {
++    let dir = tempfile::tempdir().unwrap();
++    let own = owner("market", "pet");
++    let choice = AiSelection {
++        model: Some("model-a".into()),
++        reasoning_effort: Some("ultra".into()),
++    };
++    save_selection(dir.path(), &own, &choice).unwrap();
++    assert_eq!(
++        load_selection(
++            dir.path(),
++            &JobOwner {
++                label: "window-b".into(),
++                ..own.clone()
++            }
++        )
++        .unwrap(),
++        choice
++    );
++    assert_eq!(
++        load_selection(dir.path(), &owner("dev-debug", "pet")).unwrap(),
++        AiSelection::default()
++    );
++    assert_eq!(
++        load_selection(dir.path(), &owner("market", "other")).unwrap(),
++        AiSelection::default()
++    );
++    save_selection(dir.path(), &own, &AiSelection::default()).unwrap();
++    assert_eq!(
++        load_selection(dir.path(), &own).unwrap(),
++        AiSelection::default()
++    );
++}
++#[test]
++fn validates_only_advertised_efforts_and_never_invents_defaults() {
++    let models = catalog();
++    assert!(AiSelection::default().validate("missing", &[]).is_ok());
++    assert!(AiSelection {
++        model: Some("model-a".into()),
++        reasoning_effort: Some("ultra".into())
++    }
++    .validate("model-b", &models)
++    .is_ok());
++    assert_eq!(
++        AiSelection {
++            model: Some("absent".into()),
++            reasoning_effort: None
++        }
++        .validate("model-a", &models)
++        .unwrap_err(),
++        "modelNotFound"
++    );
++    assert_eq!(
++        AiSelection {
++            model: Some("model-b".into()),
++            reasoning_effort: Some("high".into())
++        }
++        .validate("model-a", &models)
++        .unwrap_err(),
++        "unsupportedReasoningEffort"
++    );
++    assert_eq!(
++        AiSelection::default()
++            .for_request(&request(None, None), "model-a")
++            .reasoning_effort,
++        None
++    );
++}
++#[test]
++fn different_request_model_drops_saved_effort_without_affecting_saved_preference() {
++    let preference = AiSelection {
++        model: Some("model-a".into()),
++        reasoning_effort: Some("ultra".into()),
++    };
++    assert_eq!(
++        preference.for_request(&request(None, None), "model-b"),
++        preference
++    );
++    assert_eq!(
++        preference.for_request(&request(Some("model-b"), None), "model-a"),
++        AiSelection {
++            model: Some("model-b".into()),
++            reasoning_effort: None
++        }
++    );
++    assert_eq!(
++        preference
++            .for_request(&request(Some("model-a"), Some("high")), "model-b")
++            .reasoning_effort,
++        Some("high".into())
++    );
++}
++#[test]
++fn rejects_oversized_or_whitespace_preferences_before_storage() {
++    let dir = tempfile::tempdir().unwrap();
++    let own = owner("market", "pet");
++    for model in [" ".to_owned(), "x".repeat(513), "abc\nxyz".into()] {
++        assert!(save_selection(
++            dir.path(),
++            &own,
++            &AiSelection {
++                model: Some(model),
++                reasoning_effort: None
++            }
++        )
++        .is_err());
++    }
++    assert_eq!(
++        load_selection(dir.path(), &own).unwrap(),
++        AiSelection::default()
++    );
++}
+diff --git a/src-tauri/src/platform/ai/jobs.rs b/src-tauri/src/platform/ai/jobs.rs
+index c37cba6..947b552 100644
+--- a/src-tauri/src/platform/ai/jobs.rs
++++ b/src-tauri/src/platform/ai/jobs.rs
+@@ -8,7 +8,10 @@ use ot_ai_generate_text::{
+ };
+ use serde::Serialize;
+ use std::{
+-    sync::{atomic::{AtomicBool, Ordering}, Mutex, MutexGuard, Once, OnceLock},
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Mutex, MutexGuard, Once, OnceLock,
++    },
+     time::{Duration, Instant},
+ };
+ use tauri::{AppHandle, Webview};
+@@ -17,9 +20,13 @@ static JOBS: OnceLock<Mutex<JobRegistry>> = OnceLock::new();
+ static EPOCH: OnceLock<Instant> = OnceLock::new();
+ static REAPER: Once = Once::new();
+ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+-fn now() -> u64 { EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 }
++fn now() -> u64 {
++    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
++}
+ fn registry() -> Result<MutexGuard<'static, JobRegistry>, String> {
+-    JOBS.get_or_init(|| Mutex::new(JobRegistry::default())).lock().map_err(|_| "aiUnavailable".into())
++    JOBS.get_or_init(|| Mutex::new(JobRegistry::default()))
++        .lock()
++        .map_err(|_| "aiUnavailable".into())
+ }
+ 
+ fn ensure_reaper() {
+@@ -27,52 +34,76 @@ fn ensure_reaper() {
+         tauri::async_runtime::spawn(async {
+             while !SHUTDOWN.load(Ordering::Acquire) {
+                 tokio::time::sleep(Duration::from_secs(15)).await;
+-                if let Ok(mut jobs) = registry() { jobs.prune(now()); }
++                if let Ok(mut jobs) = registry() {
++                    jobs.prune(now());
++                }
+             }
+         });
+     });
+ }
+ 
+ #[derive(Serialize)]
+-pub struct StartedJob { pub id: String }
++pub struct StartedJob {
++    pub id: String,
++}
+ 
+-pub fn capabilities() -> AiCapabilities {
+-    // No per-request overrides, including for image requests.
+-    let settings = resolve_ai_settings(None).ok();
+-    AiCapabilities::from_settings(settings.as_ref())
++pub fn capabilities(app: &AppHandle, owner: &JobOwner) -> Result<AiCapabilities, String> {
++    let selection = super::model_service::get(app, owner)?;
++    let mut settings = resolve_ai_settings(None).ok();
++    if let (Some(config), Some(model)) = (&mut settings, selection.model) {
++        config.model = model;
++    }
++    Ok(AiCapabilities::from_settings(settings.as_ref()))
+ }
+ 
+-pub fn start(app: &AppHandle, webview: &Webview, owner: JobOwner, request: AiRequest) -> Result<StartedJob, String> {
++pub async fn start(
++    app: &AppHandle,
++    webview: &Webview,
++    owner: JobOwner,
++    mut request: AiRequest,
++) -> Result<StartedJob, String> {
+     request.validate()?;
+-    if SHUTDOWN.load(Ordering::Acquire) { return Err("aiUnavailable".into()); }
++    if SHUTDOWN.load(Ordering::Acquire) {
++        return Err("aiUnavailable".into());
++    }
+     ensure_reaper();
+     let id = uuid::Uuid::new_v4().to_string();
+     let cancellation = registry()?.start(id.clone(), owner.clone(), now())?;
+-    let prepared = (|| {
+-        let settings = resolve_ai_settings(None).map_err(|_| "invalidHostConfiguration".to_owned())?;
+-        let mut image_bytes = 0usize;
+-        let built = prepare_request(&request, &settings.model, |image_id| {
+-            // Capture ownership/permission is checked independently on every image.
+-            // Arc bytes are borrowed; AI never consumes or extends the caller's lease.
+-            let capture_owner = capture::identity::caller(app, webview).map_err(|error| error.code)?;
+-            let bytes = capture::service::image_bytes(&capture_owner, image_id).map_err(|error| error.code)?;
+-            image_bytes = image_bytes.saturating_add(bytes.len());
+-            if image_bytes > 32 * 1024 * 1024 { return Err("imagesTooLarge".into()); }
+-            Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes.as_ref())))
+-        })?;
+-        // The reservation precedes this second authorization. A close during
+-        // preparation either invalidates identity or removes/cancels the reservation.
+-        if super::transport::ai_owner(app, webview)? != owner { return Err("forbidden".into()); }
+-        Ok((settings, built))
+-    })();
+-    let (settings, built) = match prepared {
+-        Ok(value) => value,
+-        Err(error) => { registry()?.remove(&id); return Err(error); }
+-    };
+     let task_id = id.clone();
++    let app = app.clone();
++    let webview = webview.clone();
++    // Return the reserved ID immediately. A slow model catalog must be cancellable
++    // by the caller before it ever starts an inference request.
+     tauri::async_runtime::spawn(async move {
+         let delta_id = task_id.clone();
+-        let provider = stream_conversation(&settings, built, move |delta| registry()?.delta(&delta_id, delta, now()));
++        let provider = async {
++            let settings = super::model_service::resolve(&app, &owner, &mut request).await?;
++            if super::transport::ai_owner(&app, &webview)? != owner {
++                return Err("forbidden".into());
++            }
++            let mut image_bytes = 0usize;
++            let built = prepare_request(&request, &settings.model, |image_id| {
++                let capture_owner =
++                    capture::identity::caller(&app, &webview).map_err(|error| error.code)?;
++                let bytes = capture::service::image_bytes(&capture_owner, image_id)
++                    .map_err(|error| error.code)?;
++                image_bytes = image_bytes.saturating_add(bytes.len());
++                if image_bytes > 32 * 1024 * 1024 {
++                    return Err("imagesTooLarge".into());
++                }
++                Ok(format!(
++                    "data:image/png;base64,{}",
++                    base64::engine::general_purpose::STANDARD.encode(bytes.as_ref())
++                ))
++            })?;
++            if super::transport::ai_owner(&app, &webview)? != owner {
++                return Err("forbidden".into());
++            }
++            stream_conversation(&settings, built, move |delta| {
++                registry()?.delta(&delta_id, delta, now())
++            })
++            .await
++        };
+         tokio::select! {
+             biased;
+             _ = cancellation.cancelled() => {},
+@@ -93,15 +124,21 @@ pub fn read(owner: &JobOwner, id: &str, after: u64) -> Result<AiReadResult, Stri
+     jobs.prune(now());
+     jobs.read(owner, id, after)
+ }
+-pub fn cancel(owner: &JobOwner, id: &str) -> Result<(), String> { registry()?.cancel(owner, id, now()) }
++pub fn cancel(owner: &JobOwner, id: &str) -> Result<(), String> {
++    registry()?.cancel(owner, id, now())
++}
+ 
+ /// Hook actual child-Webview destruction, custom-window cleanup, and runtime
+ /// binding replacement/navigation. Drops private output and stops HTTP inference.
+ pub fn handle_window_destroyed(label: &str) {
+-    if let Ok(mut jobs) = registry() { jobs.remove_owner(label); }
++    if let Ok(mut jobs) = registry() {
++        jobs.remove_owner(label);
++    }
+ }
+ /// Hook host exit before shutting down the async runtime.
+ pub fn handle_shutdown() {
+     SHUTDOWN.store(true, Ordering::Release);
+-    if let Ok(mut jobs) = registry() { jobs.shutdown(); }
++    if let Ok(mut jobs) = registry() {
++        jobs.shutdown();
++    }
+ }
+diff --git a/src-tauri/src/platform/ai/transport.rs b/src-tauri/src/platform/ai/transport.rs
+index a0b4913..d97148a 100644
+--- a/src-tauri/src/platform/ai/transport.rs
++++ b/src-tauri/src/platform/ai/transport.rs
+@@ -2,28 +2,86 @@ use crate::platform::ai::core::{OtoolsAiChatMessageRecord, OtoolsAiGenerateTextR
+ use ot_ai_generate_text::conversation::{AiCapabilities, AiRequest};
+ use tauri::{AppHandle, Webview};
+ 
+-pub(crate) fn ai_owner(app: &AppHandle, webview: &Webview) -> Result<super::queue::JobOwner, String> {
+-    let identity = crate::platform::plugin_data::identity::caller(app, webview)
+-        .map_err(|error| error.code)?;
++pub(crate) fn ai_owner(
++    app: &AppHandle,
++    webview: &Webview,
++) -> Result<super::queue::JobOwner, String> {
++    let identity =
++        crate::platform::plugin_data::identity::caller(app, webview).map_err(|error| error.code)?;
+     Ok(super::queue::JobOwner {
+-        label: webview.label().to_owned(), source: identity.source, uuid: identity.uuid,
++        label: webview.label().to_owned(),
++        source: identity.source,
++        uuid: identity.uuid,
+     })
+ }
+ 
+ #[tauri::command]
+-pub fn otools_host_ai_capabilities(app: AppHandle, webview: Webview) -> Result<AiCapabilities, String> {
+-    ai_owner(&app, &webview)?;
+-    Ok(super::jobs::capabilities())
++pub fn otools_host_ai_capabilities(
++    app: AppHandle,
++    webview: Webview,
++) -> Result<AiCapabilities, String> {
++    let owner = ai_owner(&app, &webview)?;
++    super::jobs::capabilities(&app, &owner)
++}
++
++#[tauri::command]
++pub async fn otools_host_ai_models(
++    app: AppHandle,
++    webview: Webview,
++) -> Result<super::settings::AiModelCatalog, String> {
++    let owner = ai_owner(&app, &webview)?;
++    let result = super::model_service::catalog(&app, &owner).await?;
++    if ai_owner(&app, &webview)? != owner {
++        return Err("forbidden".into());
++    }
++    Ok(result)
++}
++
++#[tauri::command]
++pub fn otools_host_ai_get_settings(
++    app: AppHandle,
++    webview: Webview,
++) -> Result<super::settings::AiSelection, String> {
++    super::model_service::get(&app, &ai_owner(&app, &webview)?)
++}
++
++#[tauri::command]
++pub async fn otools_host_ai_save_settings(
++    app: AppHandle,
++    webview: Webview,
++    settings: super::settings::AiSelection,
++) -> Result<super::settings::AiSelection, String> {
++    let owner = ai_owner(&app, &webview)?;
++    settings.validate_syntax()?;
++    if settings.needs_catalog() {
++        let config = ot_ai_generate_text::resolve_ai_settings(None)
++            .map_err(|_| "invalidHostConfiguration".to_owned())?;
++        super::model_service::validate(&settings, &config).await?;
++    }
++    if ai_owner(&app, &webview)? != owner {
++        return Err("forbidden".into());
++    }
++    super::model_service::persist(&app, &owner, &settings)?;
++    Ok(settings)
+ }
+ 
+ #[tauri::command]
+-pub fn otools_host_ai_start(app: AppHandle, webview: Webview, request: AiRequest) -> Result<super::jobs::StartedJob, String> {
++pub async fn otools_host_ai_start(
++    app: AppHandle,
++    webview: Webview,
++    request: AiRequest,
++) -> Result<super::jobs::StartedJob, String> {
+     let owner = ai_owner(&app, &webview)?;
+-    super::jobs::start(&app, &webview, owner, request)
++    super::jobs::start(&app, &webview, owner, request).await
+ }
+ 
+ #[tauri::command]
+-pub fn otools_host_ai_read(app: AppHandle, webview: Webview, id: String, after: u64) -> Result<super::queue::AiReadResult, String> {
++pub fn otools_host_ai_read(
++    app: AppHandle,
++    webview: Webview,
++    id: String,
++    after: u64,
++) -> Result<super::queue::AiReadResult, String> {
+     let owner = ai_owner(&app, &webview)?;
+     super::jobs::read(&owner, &id, after)
+ }
+diff --git a/src-tauri/src/platform/ai/settings.rs b/src-tauri/src/platform/ai/settings.rs
+new file mode 100644
+index 0000000..5536a35
+--- /dev/null
++++ b/src-tauri/src/platform/ai/settings.rs
+@@ -0,0 +1,217 @@
++//! Host-private model preferences and catalog policy, independent of Tauri.
++use super::queue::JobOwner;
++use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
++use ot_ai_endpoints::{EndpointClient, ModelInfo, ReasoningLevel};
++use ot_ai_generate_text::{conversation::AiRequest, OtoolsAiSettings};
++use serde::{Deserialize, Serialize};
++use std::{
++    path::{Path, PathBuf},
++    sync::Mutex,
++    time::{Duration, Instant},
++};
++
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct AiSelection {
++    pub model: Option<String>,
++    pub reasoning_effort: Option<String>,
++}
++
++#[derive(Debug, Clone, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct AiModelInfo {
++    pub id: String,
++    pub owned_by: String,
++    pub capabilities: Vec<String>,
++    pub reasoning_levels: Vec<ReasoningLevel>,
++    pub default_reasoning_level: Option<String>,
++    pub context_window: Option<u64>,
++}
++impl From<ModelInfo> for AiModelInfo {
++    fn from(model: ModelInfo) -> Self {
++        Self {
++            id: model.id,
++            owned_by: model.owned_by,
++            capabilities: model.capabilities,
++            reasoning_levels: model.supported_reasoning_levels,
++            default_reasoning_level: model.default_reasoning_level,
++            context_window: model.context_window,
++        }
++    }
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct AiModelCatalog {
++    pub models: Vec<AiModelInfo>,
++    pub default_model: String,
++    pub selection: AiSelection,
++}
++
++impl AiSelection {
++    pub fn validate_syntax(&self) -> Result<(), String> {
++        for (value, maximum) in [(&self.model, 512), (&self.reasoning_effort, 64)] {
++            if value.as_ref().is_some_and(|value| {
++                value.trim().is_empty()
++                    || value.len() > maximum
++                    || value.chars().any(char::is_control)
++                    || value.trim() != value
++            }) {
++                return Err("invalidSettings".into());
++            }
++        }
++        Ok(())
++    }
++    pub fn needs_catalog(&self) -> bool {
++        self.model.is_some() || self.reasoning_effort.is_some()
++    }
++
++    pub fn validate(&self, default_model: &str, models: &[AiModelInfo]) -> Result<(), String> {
++        self.validate_syntax()?;
++        if !self.needs_catalog() {
++            return Ok(());
++        }
++        let id = self.model.as_deref().unwrap_or(default_model);
++        let model = models
++            .iter()
++            .find(|model| model.id == id)
++            .ok_or("modelNotFound")?;
++        if let Some(effort) = &self.reasoning_effort {
++            if !model
++                .reasoning_levels
++                .iter()
++                .any(|level| &level.effort == effort)
++            {
++                return Err("unsupportedReasoningEffort".into());
++            }
++        }
++        Ok(())
++    }
++
++    /// An explicit different model must not inherit another model's saved effort.
++    pub fn for_request(&self, request: &AiRequest, default_model: &str) -> Self {
++        let same_model = request
++            .model
++            .as_deref()
++            .is_none_or(|model| model == self.model.as_deref().unwrap_or(default_model));
++        Self {
++            model: request.model.clone().or_else(|| self.model.clone()),
++            reasoning_effort: request
++                .reasoning_effort
++                .clone()
++                .or_else(|| same_model.then(|| self.reasoning_effort.clone()).flatten()),
++        }
++    }
++}
++
++// Do not derive Debug: this key contains a credential. One entry bounds memory and
++// replacement invalidates cached metadata on endpoint/key/default model changes.
++#[derive(PartialEq, Eq)]
++struct CatalogKey {
++    provider: String,
++    base_url: String,
++    api_key: String,
++    default_model: String,
++}
++impl From<&OtoolsAiSettings> for CatalogKey {
++    fn from(settings: &OtoolsAiSettings) -> Self {
++        Self {
++            provider: settings.provider.clone(),
++            base_url: settings.base_url.clone(),
++            api_key: settings.api_key.clone(),
++            default_model: settings.model.clone(),
++        }
++    }
++}
++struct CachedCatalog {
++    key: CatalogKey,
++    fetched_at: Instant,
++    models: Vec<AiModelInfo>,
++}
++#[derive(Default)]
++pub struct CatalogCache {
++    entry: Option<CachedCatalog>,
++}
++impl CatalogCache {
++    pub fn invalidate(&mut self) {
++        self.entry = None;
++    }
++    pub async fn models(
++        &mut self,
++        settings: &OtoolsAiSettings,
++    ) -> Result<Vec<AiModelInfo>, String> {
++        let key = CatalogKey::from(settings);
++        if let Some(entry) = &self.entry {
++            if entry.key == key && entry.fetched_at.elapsed() < Duration::from_secs(60) {
++                return Ok(entry.models.clone());
++            }
++        }
++        self.entry = None;
++        // resolve_ai_settings(None) already uses the official ai-switch text
++        // settings helper. Its versioned API base also works for legacy providers.
++        let client = EndpointClient::new(&settings.base_url, &settings.api_key)
++            .map_err(|_| "modelsUnavailable".to_owned())?;
++        let models: Vec<AiModelInfo> =
++            tokio::time::timeout(Duration::from_secs(15), client.models_from_api_base())
++                .await
++                .map_err(|_| "modelsUnavailable".to_owned())?
++                .map_err(|_| "modelsUnavailable".to_owned())?
++                .into_iter()
++                .map(Into::into)
++                .collect();
++        self.entry = Some(CachedCatalog {
++            key,
++            fetched_at: Instant::now(),
++            models: models.clone(),
++        });
++        Ok(models)
++    }
++}
++
++static PREFERENCES_LOCK: Mutex<()> = Mutex::new(());
++
++fn preferences_path(app_data: &Path, owner: &JobOwner) -> PathBuf {
++    app_data
++        .join("ai-preferences")
++        .join(URL_SAFE_NO_PAD.encode(owner.source.as_bytes()))
++        .join(URL_SAFE_NO_PAD.encode(owner.uuid.as_bytes()))
++        .join("selection.json")
++}
++
++pub fn load_selection(app_data: &Path, owner: &JobOwner) -> Result<AiSelection, String> {
++    let _guard = PREFERENCES_LOCK
++        .lock()
++        .map_err(|_| "settingsUnavailable".to_owned())?;
++    match std::fs::read(preferences_path(app_data, owner)) {
++        Ok(bytes) => {
++            let value: AiSelection =
++                serde_json::from_slice(&bytes).map_err(|_| "settingsReadFailed".to_owned())?;
++            value.validate_syntax()?;
++            Ok(value)
++        }
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AiSelection::default()),
++        Err(_) => Err("settingsReadFailed".into()),
++    }
++}
++
++/// Only callers with an authenticated owner and validated selection may write.
++/// The app-data root is supplied by the host, never by plugin arguments.
++pub fn save_selection(
++    app_data: &Path,
++    owner: &JobOwner,
++    selection: &AiSelection,
++) -> Result<(), String> {
++    selection.validate_syntax()?;
++    let _guard = PREFERENCES_LOCK
++        .lock()
++        .map_err(|_| "settingsUnavailable".to_owned())?;
++    let path = preferences_path(app_data, owner);
++    let temporary = path.with_extension("tmp");
++    let result = ot_storage::write_json_file(&temporary, selection).and_then(|_| {
++        std::fs::rename(&temporary, &path).map_err(|_| "settingsSaveFailed".to_owned())
++    });
++    if result.is_err() {
++        let _ = std::fs::remove_file(&temporary);
++    }
++    result.map_err(|_| "settingsSaveFailed".into())
++}
+diff --git a/src-tauri/src/platform/ai/model_service.rs b/src-tauri/src/platform/ai/model_service.rs
+new file mode 100644
+index 0000000..e4920f8
+--- /dev/null
++++ b/src-tauri/src/platform/ai/model_service.rs
+@@ -0,0 +1,68 @@
++use super::{
++    queue::JobOwner,
++    settings::{self, AiModelCatalog, AiModelInfo, AiSelection, CatalogCache},
++};
++use ot_ai_generate_text::{conversation::AiRequest, resolve_ai_settings, OtoolsAiSettings};
++use std::{path::PathBuf, sync::OnceLock};
++use tauri::{AppHandle, Manager};
++
++static CATALOG: OnceLock<tokio::sync::Mutex<CatalogCache>> = OnceLock::new();
++fn root(app: &AppHandle) -> Result<PathBuf, String> {
++    app.path()
++        .app_data_dir()
++        .map_err(|_| "settingsUnavailable".into())
++}
++pub fn get(app: &AppHandle, owner: &JobOwner) -> Result<AiSelection, String> {
++    settings::load_selection(&root(app)?, owner)
++}
++pub fn persist(app: &AppHandle, owner: &JobOwner, selection: &AiSelection) -> Result<(), String> {
++    settings::save_selection(&root(app)?, owner, selection)
++}
++pub async fn models(
++    settings: &OtoolsAiSettings,
++    refresh: bool,
++) -> Result<Vec<AiModelInfo>, String> {
++    tokio::time::timeout(std::time::Duration::from_secs(20), async {
++        let mut cache = CATALOG
++            .get_or_init(|| tokio::sync::Mutex::new(CatalogCache::default()))
++            .lock()
++            .await;
++        if refresh {
++            cache.invalidate();
++        }
++        cache.models(settings).await
++    })
++    .await
++    .map_err(|_| "modelsUnavailable".to_owned())?
++}
++pub async fn catalog(app: &AppHandle, owner: &JobOwner) -> Result<AiModelCatalog, String> {
++    let config = resolve_ai_settings(None).map_err(|_| "invalidHostConfiguration".to_owned())?;
++    let models = models(&config, true).await?;
++    Ok(AiModelCatalog {
++        models,
++        default_model: config.model,
++        selection: get(app, owner)?,
++    })
++}
++pub async fn validate(selection: &AiSelection, config: &OtoolsAiSettings) -> Result<(), String> {
++    selection.validate_syntax()?;
++    if !selection.needs_catalog() {
++        return Ok(());
++    }
++    selection.validate(&config.model, &models(config, false).await?)
++}
++pub async fn resolve(
++    app: &AppHandle,
++    owner: &JobOwner,
++    request: &mut AiRequest,
++) -> Result<OtoolsAiSettings, String> {
++    let mut config =
++        resolve_ai_settings(None).map_err(|_| "invalidHostConfiguration".to_owned())?;
++    let selection = get(app, owner)?.for_request(request, &config.model);
++    validate(&selection, &config).await?;
++    if let Some(model) = selection.model {
++        config.model = model;
++    }
++    request.reasoning_effort = selection.reasoning_effort;
++    Ok(config)
++}
+diff --git a/src-tauri/src/platform/ai/mod.rs b/src-tauri/src/platform/ai/mod.rs
+index 0306986..bddd263 100644
+--- a/src-tauri/src/platform/ai/mod.rs
++++ b/src-tauri/src/platform/ai/mod.rs
+@@ -1,8 +1,10 @@
+ pub mod core;
+ pub mod endpoints;
+ pub mod jobs;
++pub mod model_service;
+ pub mod queue;
+ pub mod service;
++pub mod settings;
+ pub mod transport;
+ 
+ pub use core::*;
+diff --git a/docs/plugin-ai-models.md b/docs/plugin-ai-models.md
+new file mode 100644
+index 0000000..b6de2c0
+--- /dev/null
++++ b/docs/plugin-ai-models.md
+@@ -0,0 +1,59 @@
++# Plugin AI models and reasoning
++
++Otools owns the AI gateway URL, credentials, and request transport. A plugin selects a model and supported reasoning effort through `window.otools.ai`; it never needs to copy the host's API key.
++
++## Model catalog
++
++```ts
++const catalog = await window.otools.ai.models();
++// { defaultModel, selection: { model, reasoningEffort }, models: [...] }
++
++for (const model of catalog.models) {
++  console.log(model.id, model.capabilities, model.reasoningLevels);
++}
++```
++
++The host retrieves the configured gateway's `GET /v1/models` and normalizes these fields:
++
++| Gateway field | Plugin field |
++| --- | --- |
++| `id` | `id` (exact identifier; prefixes retained) |
++| `owned_by` | `ownedBy` |
++| `capabilities` | `capabilities` |
++| `supported_reasoning_levels` | `reasoningLevels: { effort, description }[]` |
++| `default_reasoning_level` | `defaultReasoningLevel` or `null` |
++| `context_window` | `contextWindow` or `null` |
++
++Metadata absence is unknown capability, not evidence that a model cannot reason. An empty `reasoningLevels` array means no configurable reasoning choices were advertised; a plugin should leave the effort unspecified. Media generation capability does not establish image understanding support. Model names must not be used to infer capabilities.
++
++## Plugin-specific preferences
++
++```ts
++const previous = await window.otools.ai.getSettings();
++await window.otools.ai.saveSettings({
++  model: catalog.models[0].id,
++  reasoningEffort: null,
++});
++// Follow host defaults again:
++await window.otools.ai.saveSettings({ model: null, reasoningEffort: null });
++```
++
++Preferences are owned by the authenticated source + plugin UUID, shared across that plugin's windows, and independent of other plugins. The host validates configured models and advertised effort values. Save failure preserves the previous settings. A model that disappears is reported as unavailable rather than silently replaced.
++
++`null` model follows the host's current default. `null` reasoning effort omits the wire parameter and leaves behavior to the service. The gateway's reported default is useful UI metadata; it is not silently substituted for an omitted parameter.
++
++## Per-request overrides
++
++```ts
++const answer = await window.otools.ai.consume({
++  model: selectedModel.id,
++  reasoningEffort: selectedModel.reasoningLevels[0]?.effort,
++  messages: [{ role: 'user', content: [{ type: 'text', text: 'Explain the trade-offs.' }] }],
++}, { signal: controller.signal, onEvent(event) { /* handle text deltas */ } });
++```
++
++Omitting both fields uses the plugin preferences, then host defaults. An explicit different model must not inherit a reasoning effort selected for another model. Unknown fields such as `apiKey`, `provider`, and `baseUrl` remain forbidden.
++
++The host serializes the effort as top-level `reasoning_effort` on its OpenAI-compatible chat request. In ai-switch, Chat → Responses converts this to `reasoning.effort`. No model-name suffix is generated. Selection changes affect subsequent requests; callers should cancel active work before switching where continuity matters.
++
++These controls select inference behavior; they do not expose hidden chain-of-thought content. The existing stream API continues to return response text, completion, cancellation, and errors.
+diff --git a/src-tauri/src/builtin_plugin_handlers.rs b/src-tauri/src/builtin_plugin_handlers.rs
+index 39723f6..2fbb304 100644
+--- a/src-tauri/src/builtin_plugin_handlers.rs
++++ b/src-tauri/src/builtin_plugin_handlers.rs
+@@ -113,6 +113,9 @@ macro_rules! otools_app_invoke_handler {
+             crate::platform::ai::endpoints::otools_ai_video_content,
+             crate::platform::ai::transport::otools_ai_generate_text,
+             crate::platform::ai::transport::otools_host_ai_capabilities,
++            crate::platform::ai::transport::otools_host_ai_models,
++            crate::platform::ai::transport::otools_host_ai_get_settings,
++            crate::platform::ai::transport::otools_host_ai_save_settings,
+             crate::platform::ai::transport::otools_host_ai_start,
+             crate::platform::ai::transport::otools_host_ai_read,
+             crate::platform::ai::transport::otools_host_ai_cancel,
+diff --git a/src-tauri/permissions/app-all.json b/src-tauri/permissions/app-all.json
+index 43cebc9..764eb29 100644
+--- a/src-tauri/permissions/app-all.json
++++ b/src-tauri/permissions/app-all.json
+@@ -102,6 +102,9 @@
+           "otools_ai_video_content",
+           "otools_ai_generate_text",
+           "otools_host_ai_capabilities",
++          "otools_host_ai_models",
++          "otools_host_ai_get_settings",
++          "otools_host_ai_save_settings",
+           "otools_host_ai_start",
+           "otools_host_ai_read",
+           "otools_host_ai_cancel",

@@ -19,7 +19,7 @@ const LOCAL_TAURI_EVENT_PREFIX = "otools-tauri:";
 const TAURI_LISTEN_TARGET = { kind: "Any" } as const;
 // Gallery editors are separate host webviews. Their update event must cross the
 // Tauri event bus rather than the plugin dylib/local DOM event bridge.
-const HOST_OWNED_EVENTS = new Set(['crop-images-updated', 'otools:custom-open']);
+const HOST_OWNED_EVENTS = new Set(['crop-images-updated', 'otools:custom-open', 'otools:deep-link-ready']);
 
 const DIRECT_TAURI_NOOP_COMMANDS = new Set([
   "set_window_theme",
@@ -78,6 +78,7 @@ const isHostPluginStateCommand = (command: string) =>
 // answers "Unknown method" there, which the fallback does catch.
 const HOST_OWNED_COMMAND_PREFIX = "otools_host_";
 const HOST_OWNED_COMMANDS = new Set([
+  'otools_copy_text',
   'otools_ai_switch_status',
   'otools_ai_switch_models',
   'otools_ai_embeddings',
@@ -90,11 +91,15 @@ const HOST_OWNED_COMMANDS = new Set([
   'otools_ai_generate_text',
   'otools_ai_load_chat_history',
   'otools_ai_save_chat_history',
+  'hide_panel_window',
   'detach_tools_tab_to_window',
   'open_custom_plugin_window',
   'list_custom_plugin_windows',
   'close_custom_plugin_windows',
   'custom_plugin_window_ready',
+  'tools_webview_browse_dialog',
+  'tools_webview_list_dir',
+  'tools_webview_read_file',
 ]);
 const isHostOwnedCommand = (command: string) =>
   command.startsWith(HOST_OWNED_COMMAND_PREFIX) || HOST_OWNED_COMMANDS.has(command);
@@ -367,6 +372,22 @@ const invokeSharedHostFilesystemCommand = async (
   command: string,
   payload: InvokePayload,
 ): Promise<unknown | typeof SHARED_HOST_COMMAND_NOT_HANDLED> => {
+  if (command === "tools_webview_list_dir" && typeof otools.listHostDir === "function") {
+    return otools.listHostDir(readPayloadString(command, payload, "path"));
+  }
+
+  if (command === "tools_webview_read_file" && typeof otools.readHostFile === "function") {
+    return otools.readHostFile(readPayloadString(command, payload, "path"));
+  }
+
+  // Older embedded runtimes sent a flat browse payload and discarded the requested
+  // path. Use the host command directly when IPC is available; wrapper-only remote
+  // runtimes still use their exposed browse API.
+  if (command === "tools_webview_browse_dialog" && typeof otools.browseHostDir === "function" && !getTauriInternals()?.invoke) {
+    const request = asPayloadRecord(asPayloadRecord(payload)?.request);
+    return otools.browseHostDir(String(request?.path ?? "").trim());
+  }
+
   if (
     command === "read_directory_recursive" &&
     typeof otools.listHostDir === "function"

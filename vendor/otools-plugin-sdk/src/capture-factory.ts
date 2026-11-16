@@ -14,7 +14,16 @@ export interface CapturePermission { granted: boolean; canRequest: boolean }
 export type CaptureRepairResult = { status: 'reset'; restartRequired: boolean } | { status: 'cancelled'; restartRequired: boolean };
 export type CaptureCompletedResult = { status: 'completed'; captureId: string; image: CaptureImage; displayId: string; rect: CaptureRect; action: 'complete' | 'copy' | 'pin' };
 export type CaptureResult = CaptureCompletedResult | { status: 'cancelled'; captureId: string } | { status: 'error'; captureId: string; error: CaptureFailure };
-export interface CaptureSelectOptions { edit?: boolean; hideHost?: boolean }
+export interface CaptureSelectOptions {
+  edit?: boolean;
+  hideHost?: boolean;
+  /** Select an area (default) or confirm one physical screen pixel. */
+  mode?: 'region' | 'color';
+  /** Restore windows hidden by capture on completion/cancellation; defaults to true. */
+  restoreHost?: boolean;
+  /** Color selection: false (default) samples the live screen; true freezes it. Region selection always freezes. */
+  freezeScreen?: boolean;
+}
 export interface CaptureScreenOptions { displayId?: string; hideHost?: boolean }
 export interface CaptureRegionOptions { displayId: string; rect: CaptureRect; hideHost?: boolean }
 export interface CaptureWindowOptions { windowId?: string; hideHost?: boolean }

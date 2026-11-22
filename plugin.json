@@ -18,5 +18,6 @@
     "width": 215, "height": 228,
     "transparent": true, "decorations": false, "shadow": false,
     "resizable": true, "alwaysOnTop": true, "skipTaskbar": true
-  }
+  },
+  "openSourceUrl": "https://github.com/ootools/otools-lingchat"
 }
